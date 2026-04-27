@@ -81,7 +81,15 @@ fn editInEditor(
     // `withCookedMode` brackets the spawn with pause + resume. Any
     // failure to re-enter raw mode is propagated, not silently
     // swallowed (`defer ... catch {}` is the trap to avoid).
-    try action_ctx.withCookedMode(tmp_path, spawnEditor);
+    // The polymorphic return type lets `spawnEditor` thread the
+    // editor's exit status out of the cooked-mode scope without a
+    // side-channel.
+    const exit_code = try action_ctx.withCookedMode(tmp_path, spawnEditor);
+
+    // User aborted (e.g. `:cq` in vi, or any non-zero exit). Per
+    // the documented contract, `.no_op` is the canonical cancel
+    // path; the buffer stays as it was before the action.
+    if (exit_code != 0) return .no_op;
 
     const fd = std.c.open(tmp_path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.OpenFailed;
@@ -108,9 +116,12 @@ fn editInEditor(
 }
 
 /// Fork + execvp `$EDITOR` (or `vi` if unset) to edit `tmp_path`,
-/// then wait. Runs while the terminal is in cooked mode so the
-/// editor sees a normal TTY.
-fn spawnEditor(tmp_path: [:0]const u8) anyerror!void {
+/// then wait. Returns the editor's exit code so the caller can
+/// distinguish "saved and exited" (0) from "aborted" (non-zero).
+/// Runs while the terminal is in cooked mode so the editor sees a
+/// normal TTY. Pure function — no terminal state, no editor
+/// reference; trivially testable in isolation.
+fn spawnEditor(tmp_path: [:0]const u8) anyerror!u8 {
     const editor_cmd = std.c.getenv("EDITOR") orelse "vi";
     const cmd_z: [*:0]const u8 = @ptrCast(editor_cmd);
     var argv = [_:null]?[*:0]const u8{ cmd_z, tmp_path.ptr };
@@ -122,6 +133,8 @@ fn spawnEditor(tmp_path: [:0]const u8) anyerror!void {
     }
     var status: c_int = 0;
     _ = std.c.waitpid(child, &status, 0);
+    // POSIX `WEXITSTATUS(status)`: low 8 bits of (status >> 8).
+    return @intCast((status >> 8) & 0xff);
 }
 
 pub fn main(init: std.process.Init) !u8 {
