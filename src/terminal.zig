@@ -44,18 +44,35 @@ pub const Terminal = struct {
         if (std.c.tcgetattr(self.input_fd, &saved) != 0) return error.NotATty;
 
         var raw = saved;
-        // Byte-at-a-time, no kernel echo (we draw ourselves).
-        raw.lflag.ICANON = false;
-        raw.lflag.ECHO = false;
-        // ISIG off so Ctrl-C/Ctrl-Z arrive as bytes (0x03, 0x1a) and
-        // the editor's keymap dispatches them. Apps that want kernel
-        // signal delivery (e.g. shells that need to interrupt
-        // blocking child processes) will opt in via a future
-        // `signal_policy` option.
-        raw.lflag.ISIG = false;
-        // Turn off CR→NL translation; turn off Ctrl-S/Ctrl-Q output flow.
-        raw.iflag.ICRNL = false;
-        raw.iflag.IXON = false;
+
+        // Local flags (cfmakeraw-equivalent — all "cooked" features off).
+        raw.lflag.ICANON = false; // byte-at-a-time, no line discipline
+        raw.lflag.ECHO = false; // we draw the cursor ourselves
+        raw.lflag.ECHONL = false; // and we don't want kernel newline echo either
+        raw.lflag.ISIG = false; // Ctrl-C / Ctrl-Z arrive as bytes (keymap dispatches)
+        raw.lflag.IEXTEN = false; // Ctrl-V doesn't quote the next byte
+
+        // Input flags (cfmakeraw + UTF-8-friendly).
+        raw.iflag.ICRNL = false; // don't auto-translate CR → NL on input
+        raw.iflag.IXON = false; // Ctrl-S / Ctrl-Q don't suspend output
+        raw.iflag.BRKINT = false; // break doesn't synthesize SIGINT
+        raw.iflag.IGNBRK = false; // ... and isn't ignored either
+        raw.iflag.PARMRK = false; // no parity-error byte marking
+        raw.iflag.INLCR = false; // no NL → CR translation on input
+        raw.iflag.IGNCR = false; // don't drop CR
+        raw.iflag.INPCK = false; // no parity check
+        raw.iflag.ISTRIP = false; // don't strip the 8th bit (UTF-8 needs all 8)
+
+        // Output flags. The big one is OPOST: with ONLCR enabled (the
+        // default), our deliberately emitted "\n\r" autowrap-fix
+        // becomes "\r\n\r" and the cursor lands one column off. The
+        // renderer assumes raw output throughout.
+        raw.oflag.OPOST = false;
+
+        // Control flags: 8-bit chars, no parity.
+        raw.cflag.CSIZE = .CS8;
+        raw.cflag.PARENB = false;
+
         // Read returns as soon as 1 byte is available.
         raw.cc[@intFromEnum(std.c.V.MIN)] = 1;
         raw.cc[@intFromEnum(std.c.V.TIME)] = 0;

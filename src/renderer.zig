@@ -7,14 +7,21 @@
 //!     (so escapes in the prompt don't break column accounting).
 //!   - cursor is byte-offset into the buffer; we walk clusters to
 //!     compute the cursor's column, not raw byte count.
-//!   - highlight is span-based: spans are sorted, validated, and
-//!     SGR is emitted at boundaries.
+//!   - highlight spans are sorted, validated (non-overlapping, end >
+//!     start, in-range), and snapped to cluster boundaries before
+//!     SGR emission. Bad spans are dropped, not propagated.
 //!   - prior-block clearing is per-row `\x1b[K` (contained), not the
 //!     `\x1b[J` clear-to-EOS slash used (which nukes app output below).
+//!   - on detected width change, the renderer scrolls past the
+//!     reflowed-by-the-terminal old block and starts fresh.
 //!   - writes go through `Terminal.writeAll` (handles partial writes /
 //!     EINTR), not bare `std.c.write`.
 //!   - the column math is split out into `Layout.compute` so it's
 //!     unit-testable without a real terminal.
+//!   - the renderer holds no pointer to the Terminal — the caller
+//!     passes one in to each `render` / `finalize` call. This lets
+//!     `Editor` be returned by value from `init` without the classic
+//!     intrusive-pointer-into-stack-local hazard.
 //!
 //! Row-granular diff is the next milestone (FUTURE.md).
 
@@ -80,49 +87,77 @@ pub const Layout = struct {
 
 pub const Renderer = struct {
     allocator: Allocator,
-    terminal: *terminal_mod.Terminal,
     width_policy: grapheme.WidthPolicy,
 
     /// State carried across renders for repaint correctness.
     last_rows: usize = 0,
     last_cursor_row: usize = 0,
     last_term_cols: u16 = 0,
-    force_repaint: bool = true,
 
-    /// Scratch output buffer; reused across renders to avoid
-    /// per-keystroke allocation. 64 KB is plenty for any humanly-
-    /// typed line at typical terminal widths.
-    out_buf: [65536]u8 = undefined,
+    /// Reusable output buffer. Grown lazily; capacity is retained
+    /// across renders to amortize allocation cost. For typical lines
+    /// this stabilizes at a few KB after the first render.
+    out_buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    /// Reusable normalized-span buffer. Same amortization story.
+    span_buf: std.ArrayListUnmanaged(highlight.HighlightSpan) = .empty,
 
     pub fn init(
         allocator: Allocator,
-        terminal: *terminal_mod.Terminal,
         width_policy: grapheme.WidthPolicy,
     ) Renderer {
         return .{
             .allocator = allocator,
-            .terminal = terminal,
             .width_policy = width_policy,
         };
     }
 
-    pub fn invalidate(self: *Renderer) void {
-        self.force_repaint = true;
+    pub fn deinit(self: *Renderer) void {
+        self.out_buf.deinit(self.allocator);
+        self.span_buf.deinit(self.allocator);
+    }
+
+    /// Tell the renderer that the cursor is at column 0 of a fresh
+    /// row AND no rendered block is on screen below it (e.g. because
+    /// the caller just wrote "\r\n", "^C\r\n", cleared the screen,
+    /// or finished a `readLine` via `finalize`). The next `render`
+    /// writes from the current cursor position without trying to
+    /// climb up to a prior block.
+    pub fn markFresh(self: *Renderer) void {
         self.last_rows = 0;
         self.last_cursor_row = 0;
+        self.last_term_cols = 0;
     }
 
     /// Repaint the prompt + buffer + cursor.
     pub fn render(
         self: *Renderer,
+        terminal: *terminal_mod.Terminal,
         prompt: prompt_mod.Prompt,
         buffer: *buffer_mod.Buffer,
         spans: []const highlight.HighlightSpan,
     ) !void {
         try buffer.ensureClusters();
-        const size = self.terminal.querySize();
+        const size = terminal.querySize();
         const cols: usize = if (size.cols == 0) 80 else size.cols;
-        if (self.last_term_cols != size.cols) self.invalidate();
+
+        // Width changed since last render: the terminal has already
+        // reflowed our prior block in ways we can't reconstruct.
+        // Best-effort: emit enough `\r\n`s to land below the bottom
+        // of the old block (in the old width), then start fresh.
+        // Old content stays in scrollback. Without reflow this is
+        // exact; with reflow it's a heuristic, and visual artifacts
+        // are accepted as the cost of a mid-edit resize.
+        if (self.last_term_cols != 0 and self.last_term_cols != size.cols and self.last_rows > 0) {
+            const rows_below = if (self.last_rows > self.last_cursor_row)
+                self.last_rows - self.last_cursor_row
+            else
+                1;
+            var i: usize = 0;
+            while (i < rows_below) : (i += 1) try terminal.writeAll("\r\n");
+            self.last_rows = 0;
+            self.last_cursor_row = 0;
+        }
         self.last_term_cols = size.cols;
 
         const layout = Layout.compute(
@@ -132,7 +167,12 @@ pub const Renderer = struct {
             cols,
         );
 
-        var w = std.Io.Writer.fixed(&self.out_buf);
+        const normalized = try self.normalizeSpans(buffer, spans);
+
+        self.out_buf.clearRetainingCapacity();
+        var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &self.out_buf);
+        defer self.out_buf = aw.toArrayList();
+        const w = &aw.writer;
 
         // Step 1 — climb to the top of the previous render.
         if (self.last_cursor_row > 0) {
@@ -158,7 +198,7 @@ pub const Renderer = struct {
 
         // Step 3 — write prompt + buffer (with optional spans).
         try w.writeAll(prompt.bytes);
-        try writeBuffer(&w, buffer, spans);
+        try writeBuffer(w, buffer, normalized);
 
         // Step 4 — phantom-newline fix for the autowrap edge case.
         if (layout.needs_phantom_nl) try w.writeAll("\n\r");
@@ -175,38 +215,136 @@ pub const Renderer = struct {
             try w.print("\x1b[{d}C", .{layout.cursor_col});
         }
 
-        const bytes = w.buffered();
-        try self.terminal.writeAll(bytes);
+        try terminal.writeAll(aw.written());
 
         self.last_rows = layout.rows;
         self.last_cursor_row = layout.cursor_row;
-        self.force_repaint = false;
     }
 
     /// Move cursor below the rendered area and emit a newline. Called
     /// at the end of `readLine` so subsequent program output starts on
     /// a fresh row.
-    pub fn finalize(self: *Renderer) !void {
-        // Move from last_cursor_row to last_rows, then \r\n.
-        if (self.last_rows > self.last_cursor_row + 1) {
-            var b: [16]u8 = undefined;
-            const s = std.fmt.bufPrint(
-                &b,
-                "\x1b[{d}B",
-                .{self.last_rows - self.last_cursor_row - 1},
-            ) catch "";
-            try self.terminal.writeAll(s);
+    pub fn finalize(self: *Renderer, terminal: *terminal_mod.Terminal) !void {
+        // If the previous render emitted a phantom newline, the cursor
+        // is already at column 0 of a fresh row past the content
+        // (`last_cursor_row == last_rows`). Adding another `\r\n`
+        // would print a needless blank line.
+        const at_phantom = self.last_cursor_row >= self.last_rows;
+        if (!at_phantom) {
+            if (self.last_rows > self.last_cursor_row + 1) {
+                var b: [16]u8 = undefined;
+                const s = std.fmt.bufPrint(
+                    &b,
+                    "\x1b[{d}B",
+                    .{self.last_rows - self.last_cursor_row - 1},
+                ) catch "";
+                try terminal.writeAll(s);
+            }
+            try terminal.writeAll("\r\n");
         }
-        try self.terminal.writeAll("\r\n");
         self.last_rows = 0;
         self.last_cursor_row = 0;
+        self.last_term_cols = 0;
+    }
+
+    /// Validate, sort, snap-to-cluster-boundaries, and dedup-overlap
+    /// the caller-supplied spans. Returns a slice borrowed from
+    /// `self.span_buf` (valid until the next `render`).
+    fn normalizeSpans(
+        self: *Renderer,
+        buffer: *buffer_mod.Buffer,
+        in: []const highlight.HighlightSpan,
+    ) ![]highlight.HighlightSpan {
+        self.span_buf.clearRetainingCapacity();
+        if (in.len == 0) return self.span_buf.items;
+        const buf_len = buffer.bytes.items.len;
+
+        try self.span_buf.ensureUnusedCapacity(self.allocator, in.len);
+        for (in) |sp| {
+            if (sp.end <= sp.start) continue; // empty or inverted
+            if (sp.start >= buf_len) continue; // wholly past buffer
+            const clamped_end = if (sp.end > buf_len) buf_len else sp.end;
+
+            const snap = snapSpanToClusters(buffer.clusters.items, sp.start, clamped_end);
+            if (snap.start >= snap.end) continue;
+            self.span_buf.appendAssumeCapacity(.{
+                .start = snap.start,
+                .end = snap.end,
+                .style = sp.style,
+            });
+        }
+
+        // Stable sort by (start, then end). With equal-start spans
+        // (which can happen when two distinct inputs snap outward to
+        // the same cluster boundary), this guarantees a deterministic
+        // "earliest input wins" + "longer span wins on tie" outcome
+        // for the dedup-overlap pass below.
+        std.mem.sort(highlight.HighlightSpan, self.span_buf.items, {}, struct {
+            fn lt(_: void, a: highlight.HighlightSpan, b: highlight.HighlightSpan) bool {
+                if (a.start != b.start) return a.start < b.start;
+                return a.end > b.end;
+            }
+        }.lt);
+
+        // Drop overlaps: keep the earliest, drop any whose start <
+        // the kept span's end.
+        var write_idx: usize = 0;
+        var i: usize = 0;
+        while (i < self.span_buf.items.len) : (i += 1) {
+            const cur = self.span_buf.items[i];
+            if (write_idx > 0) {
+                const prev = self.span_buf.items[write_idx - 1];
+                if (cur.start < prev.end) continue; // overlaps kept span
+            }
+            self.span_buf.items[write_idx] = cur;
+            write_idx += 1;
+        }
+        self.span_buf.shrinkRetainingCapacity(write_idx);
+        return self.span_buf.items;
     }
 };
 
-/// Walk buffer clusters, emitting SGR transitions at span boundaries.
-/// Spans must be pre-sorted by `start`. Overlapping spans are not
-/// validated here; the caller (Editor) sorts and dedupes before
-/// passing them in.
+const SnappedRange = struct { start: usize, end: usize };
+
+/// Snap `[start, end)` to cluster boundaries. The start floors to the
+/// boundary at-or-before; the end ceils to the boundary at-or-after.
+/// This expands the span to cover anything the caller pointed at —
+/// the alternative (contract) silently loses requested highlighting.
+fn snapSpanToClusters(
+    clusters: []const buffer_mod.Cluster,
+    start: usize,
+    end: usize,
+) SnappedRange {
+    if (clusters.len == 0) return .{ .start = 0, .end = 0 };
+
+    var snap_start = start;
+    for (clusters) |c| {
+        if (c.byte_start <= start and start < c.byte_end) {
+            snap_start = c.byte_start;
+            break;
+        }
+        if (c.byte_start > start) {
+            // start fell exactly on a boundary that we already passed
+            // (shouldn't happen with sequential clusters, but defensive).
+            snap_start = c.byte_start;
+            break;
+        }
+    }
+
+    var snap_end = end;
+    for (clusters) |c| {
+        if (c.byte_start < end and end <= c.byte_end) {
+            snap_end = c.byte_end;
+            break;
+        }
+    }
+
+    return .{ .start = snap_start, .end = snap_end };
+}
+
+/// Walk buffer bytes, emitting SGR transitions at span boundaries.
+/// `spans` must be pre-normalized by `Renderer.normalizeSpans`:
+/// sorted, non-overlapping, cluster-aligned, in range.
 fn writeBuffer(
     w: *std.Io.Writer,
     buffer: *buffer_mod.Buffer,
@@ -223,15 +361,13 @@ fn writeBuffer(
     var active: ?highlight.Style = null;
 
     while (i < bytes.len) {
-        // Close any active span whose end is at or before i.
-        if (active != null and span_idx <= spans.len) {
+        if (active != null and span_idx > 0) {
             const cur = spans[span_idx - 1];
             if (i >= cur.end) {
                 try w.writeAll("\x1b[0m");
                 active = null;
             }
         }
-        // Open the next span if its start is here.
         if (span_idx < spans.len and spans[span_idx].start == i) {
             const sp = spans[span_idx];
             if (active != null) try w.writeAll("\x1b[0m");
@@ -346,7 +482,6 @@ test "layout: empty buffer, empty prompt, one row" {
 }
 
 test "layout: short ASCII line on wide terminal" {
-    // Prompt "$ " (2) + "hello" (5) = 7 cells; cursor at end.
     const cs = [_]buffer_mod.Cluster{
         cluster1(0, 1), cluster1(1, 2), cluster1(2, 3), cluster1(3, 4), cluster1(4, 5),
     };
@@ -362,14 +497,12 @@ test "layout: cursor mid-line lands on right column" {
     const cs = [_]buffer_mod.Cluster{
         cluster1(0, 1), cluster1(1, 2), cluster1(2, 3), cluster1(3, 4), cluster1(4, 5),
     };
-    // Cursor after "hel" (cursor_byte=3) with prompt width 2 → col 5.
     const lay = Layout.compute(2, &cs, 3, 80);
     try std.testing.expectEqual(@as(usize, 5), lay.cursor_col);
     try std.testing.expectEqual(@as(usize, 0), lay.cursor_row);
 }
 
 test "layout: exact-width line triggers phantom newline" {
-    // 8-col terminal; "$ " (2) + "abcdef" (6) = 8 cells exactly.
     var cs: [6]buffer_mod.Cluster = undefined;
     var i: usize = 0;
     while (i < 6) : (i += 1) cs[i] = cluster1(i, i + 1);
@@ -380,14 +513,10 @@ test "layout: exact-width line triggers phantom newline" {
 }
 
 test "layout: wrapped buffer occupies multiple rows" {
-    // 10-col terminal, prompt "> " (2), 18 ASCII chars.
     var cs: [18]buffer_mod.Cluster = undefined;
     var i: usize = 0;
     while (i < 18) : (i += 1) cs[i] = cluster1(i, i + 1);
     const lay = Layout.compute(2, &cs, 18, 10);
-    // total = 20, ceil(20/10) = 2 rows, but the trailing column is
-    // exactly at the boundary → phantom-nl, the terminal hasn't
-    // committed to row 1, so we treat it as 2 rows + nl correction.
     try std.testing.expectEqual(@as(usize, 20), lay.total_cols);
     try std.testing.expectEqual(@as(usize, 2), lay.rows);
     try std.testing.expectEqual(@as(usize, 2), lay.cursor_row);
@@ -396,12 +525,10 @@ test "layout: wrapped buffer occupies multiple rows" {
 }
 
 test "layout: wide CJK clusters count as 2 cells each" {
-    // 20-col terminal, no prompt, 5 CJK clusters of width 2 each.
     const cs = [_]buffer_mod.Cluster{
         cluster2(0, 3), cluster2(3, 6), cluster2(6, 9), cluster2(9, 12), cluster2(12, 15),
     };
     const lay = Layout.compute(0, &cs, 9, 20);
-    // 10 columns total, cursor after 3 clusters = 6 cells.
     try std.testing.expectEqual(@as(usize, 10), lay.total_cols);
     try std.testing.expectEqual(@as(usize, 6), lay.cursor_col);
     try std.testing.expectEqual(@as(usize, 0), lay.cursor_row);
@@ -409,14 +536,99 @@ test "layout: wide CJK clusters count as 2 cells each" {
 }
 
 test "layout: cursor on second visual row past wrap" {
-    // 5-col terminal, no prompt, 8 ASCII clusters; cursor at byte 7.
     var cs: [8]buffer_mod.Cluster = undefined;
     var i: usize = 0;
     while (i < 8) : (i += 1) cs[i] = cluster1(i, i + 1);
     const lay = Layout.compute(0, &cs, 7, 5);
-    // 8 cells / 5 per row → 2 rows; cursor at col 7 / 5 = row 1, col 2.
     try std.testing.expectEqual(@as(usize, 2), lay.rows);
     try std.testing.expectEqual(@as(usize, 1), lay.cursor_row);
     try std.testing.expectEqual(@as(usize, 2), lay.cursor_col);
     try std.testing.expect(!lay.needs_phantom_nl);
+}
+
+// =============================================================================
+// Span normalization tests
+// =============================================================================
+
+test "snapSpanToClusters: ASCII boundaries unchanged" {
+    const cs = [_]buffer_mod.Cluster{ cluster1(0, 1), cluster1(1, 2), cluster1(2, 3) };
+    const r = snapSpanToClusters(&cs, 1, 3);
+    try std.testing.expectEqual(@as(usize, 1), r.start);
+    try std.testing.expectEqual(@as(usize, 3), r.end);
+}
+
+test "snapSpanToClusters: mid-cluster start floors, mid-cluster end ceils" {
+    // Three clusters: [0,3) [3,6) [6,7). Span [1, 5) must expand to [0, 6).
+    const cs = [_]buffer_mod.Cluster{
+        .{ .byte_start = 0, .byte_end = 3, .width = 2 },
+        .{ .byte_start = 3, .byte_end = 6, .width = 2 },
+        cluster1(6, 7),
+    };
+    const r = snapSpanToClusters(&cs, 1, 5);
+    try std.testing.expectEqual(@as(usize, 0), r.start);
+    try std.testing.expectEqual(@as(usize, 6), r.end);
+}
+
+test "renderer: normalizeSpans drops empty / out-of-range spans" {
+    var rend = Renderer.init(std.testing.allocator, .{});
+    defer rend.deinit();
+
+    var b = buffer_mod.Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("abcde");
+    try b.ensureClusters();
+
+    const in = [_]highlight.HighlightSpan{
+        .{ .start = 0, .end = 0, .style = .{} }, // empty → drop
+        .{ .start = 3, .end = 2, .style = .{} }, // inverted → drop
+        .{ .start = 10, .end = 12, .style = .{} }, // beyond buffer → drop
+        .{ .start = 1, .end = 100, .style = .{ .bold = true } }, // end clamps to 5
+    };
+    const out = try rend.normalizeSpans(&b, &in);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqual(@as(usize, 1), out[0].start);
+    try std.testing.expectEqual(@as(usize, 5), out[0].end);
+}
+
+test "renderer: normalizeSpans sorts and drops overlaps" {
+    var rend = Renderer.init(std.testing.allocator, .{});
+    defer rend.deinit();
+
+    var b = buffer_mod.Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("abcdefghij");
+    try b.ensureClusters();
+
+    const in = [_]highlight.HighlightSpan{
+        .{ .start = 6, .end = 9, .style = .{ .bold = true } },
+        .{ .start = 0, .end = 3, .style = .{ .italic = true } },
+        .{ .start = 2, .end = 5, .style = .{ .underline = true } }, // overlaps the [0,3)
+        .{ .start = 7, .end = 8, .style = .{ .dim = true } }, // overlaps the [6,9)
+    };
+    const out = try rend.normalizeSpans(&b, &in);
+    try std.testing.expectEqual(@as(usize, 2), out.len);
+    try std.testing.expectEqual(@as(usize, 0), out[0].start);
+    try std.testing.expectEqual(@as(usize, 3), out[0].end);
+    try std.testing.expectEqual(@as(usize, 6), out[1].start);
+    try std.testing.expectEqual(@as(usize, 9), out[1].end);
+}
+
+test "renderer: normalizeSpans snaps mid-cluster boundaries outward" {
+    var rend = Renderer.init(std.testing.allocator, .{});
+    defer rend.deinit();
+
+    var b = buffer_mod.Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("café"); // bytes: c(0) a(1) f(2) é(3..5)
+    try b.ensureClusters();
+
+    // Span [4, 5) lands mid-é — must expand to [3, 5) so SGR doesn't
+    // splice into the middle of a UTF-8 sequence.
+    const in = [_]highlight.HighlightSpan{
+        .{ .start = 4, .end = 5, .style = .{ .bold = true } },
+    };
+    const out = try rend.normalizeSpans(&b, &in);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqual(@as(usize, 3), out[0].start);
+    try std.testing.expectEqual(@as(usize, 5), out[0].end);
 }

@@ -109,12 +109,7 @@ pub const Reader = struct {
     /// not need to know about transient interruption. EOF and hard
     /// read errors propagate.
     fn readByte(self: *Reader) !u8 {
-        if (self.pending_len > 0) {
-            const b = self.pending[0];
-            std.mem.copyForwards(u8, self.pending[0 .. self.pending_len - 1], self.pending[1..self.pending_len]);
-            self.pending_len -= 1;
-            return b;
-        }
+        if (self.pending_len > 0) return self.popPending();
         var byte: [1]u8 = undefined;
         while (true) {
             const n = std.c.read(self.fd, &byte, 1);
@@ -128,21 +123,50 @@ pub const Reader = struct {
         }
     }
 
-    /// Try to read additional bytes if the OS has them buffered, but
-    /// don't block. Used by the CSI parser to consume the rest of a
-    /// sequence after seeing `\x1b[`. The slash parser used a 2-byte
-    /// blocking read here, which fails on multi-character CSI
-    /// parameters like `\x1b[1;5D`.
-    fn readByteIfReady(self: *Reader) ?u8 {
-        if (self.pending_len > 0) {
-            const b = self.pending[0];
-            std.mem.copyForwards(u8, self.pending[0..], self.pending[1..self.pending_len]);
-            self.pending_len -= 1;
-            return b;
+    /// Read one byte with a millisecond-bounded wait. Used for escape
+    /// sequence disambiguation: bare ESC must time out within ~50ms
+    /// instead of hanging forever, while CSI/SS3 sequence bodies
+    /// (whose bytes are sent back-to-back by every real terminal)
+    /// resolve well within the window.
+    fn readByteWithin(self: *Reader, timeout_ms: i32) ?u8 {
+        if (self.pending_len > 0) return self.popPending();
+        var pfd: std.c.pollfd = .{ .fd = self.fd, .events = std.c.POLL.IN, .revents = 0 };
+        while (true) {
+            const rc = std.c.poll(@ptrCast(&pfd), 1, timeout_ms);
+            if (rc < 0) {
+                const e = std.c.errno(rc);
+                if (e == .INTR) continue;
+                return null;
+            }
+            if (rc == 0) return null; // timeout
+            break;
         }
-        // For v0.0 we just block. Bare-ESC disambiguation requires a
-        // small select() timeout (~50ms); deferred to v0.1.
         return self.readByte() catch null;
+    }
+
+    fn popPending(self: *Reader) u8 {
+        const b = self.pending[0];
+        std.mem.copyForwards(u8, self.pending[0 .. self.pending_len - 1], self.pending[1..self.pending_len]);
+        self.pending_len -= 1;
+        return b;
+    }
+
+    /// Push a byte back to the front of the pending queue. Used when
+    /// a parser speculatively consumes a byte that turned out not to
+    /// belong to it (e.g. an invalid UTF-8 continuation that's
+    /// actually a fresh keystroke).
+    fn pushBack(self: *Reader, byte: u8) void {
+        if (self.pending_len >= self.pending.len) return; // drop on overflow
+        if (self.pending_len > 0) {
+            // Shift right by one to make room at index 0.
+            std.mem.copyBackwards(
+                u8,
+                self.pending[1 .. self.pending_len + 1],
+                self.pending[0..self.pending_len],
+            );
+        }
+        self.pending[0] = byte;
+        self.pending_len += 1;
     }
 
     fn dispatch(self: *Reader, b0: u8) ?Event {
@@ -167,7 +191,7 @@ pub const Reader = struct {
 
     fn parseUtf8(self: *Reader, b0: u8) ?Event {
         const seq_len = std.unicode.utf8ByteSequenceLength(b0) catch {
-            // Invalid lead byte — drop, return unknown event.
+            // Invalid lead byte — drop b0 alone. Don't read ahead.
             self.scratch.clearRetainingCapacity();
             self.scratch.append(self.allocator, b0) catch return .{ .error_ = error.OutOfMemory };
             return .{ .key = .{ .code = .{ .unknown = self.scratch.items } } };
@@ -176,11 +200,24 @@ pub const Reader = struct {
         bytes[0] = b0;
         var i: usize = 1;
         while (i < seq_len) : (i += 1) {
-            const b = self.readByte() catch {
+            // UTF-8 continuation bytes follow the lead immediately on
+            // every well-behaved input source. A 50ms wait absorbs
+            // jitter without letting a malformed/silent stream wedge
+            // the editor on a single lead byte forever.
+            const b = self.readByteWithin(50) orelse {
                 self.scratch.clearRetainingCapacity();
                 self.scratch.appendSlice(self.allocator, bytes[0..i]) catch return .{ .error_ = error.OutOfMemory };
                 return .{ .key = .{ .code = .{ .unknown = self.scratch.items } } };
             };
+            // Each follow-on byte must be a UTF-8 continuation byte
+            // (0x80-0xBF). Anything else is the start of a fresh
+            // event; push it back and abandon this sequence.
+            if (b < 0x80 or b > 0xBF) {
+                self.pushBack(b);
+                self.scratch.clearRetainingCapacity();
+                self.scratch.appendSlice(self.allocator, bytes[0..i]) catch return .{ .error_ = error.OutOfMemory };
+                return .{ .key = .{ .code = .{ .unknown = self.scratch.items } } };
+            }
             bytes[i] = b;
         }
         const cp = std.unicode.utf8Decode(bytes[0..seq_len]) catch {
@@ -192,16 +229,21 @@ pub const Reader = struct {
     }
 
     fn parseEscape(self: *Reader) ?Event {
-        const b1 = self.readByteIfReady() orelse {
+        // ESC may be a bare keystroke OR the start of a CSI/SS3 escape
+        // sequence. We disambiguate by waiting briefly: real terminals
+        // send the rest of an escape sequence within microseconds, so
+        // a 50ms wait separates the two cases without making bare-ESC
+        // feel laggy. Tradeoff: an over-network terminal that splits
+        // a CSI across packets >50ms apart will be misread as bare
+        // ESC, which is rare in practice and recoverable (the user
+        // re-presses the key).
+        const b1 = self.readByteWithin(50) orelse {
             return .{ .key = .{ .code = .escape } };
         };
         switch (b1) {
             '[' => return self.parseCsi(),
             'O' => return self.parseSs3(),
             else => {
-                // Alt-modified single byte. If it's a printable char,
-                // emit alt+char; otherwise fall back to dispatching b1
-                // and tagging alt.
                 if (b1 >= 0x20 and b1 <= 0x7e) {
                     return .{ .key = .{ .code = .{ .char = @as(u21, b1) }, .mods = .{ .alt = true } } };
                 }
@@ -221,7 +263,7 @@ pub const Reader = struct {
         var plen: usize = 0;
         var final: u8 = 0;
         while (true) {
-            const b = self.readByteIfReady() orelse return .{ .key = .{ .code = .escape } };
+            const b = self.readByteWithin(50) orelse return .{ .key = .{ .code = .escape } };
             if (b >= 0x40 and b <= 0x7e) {
                 final = b;
                 break;
@@ -271,7 +313,7 @@ pub const Reader = struct {
     }
 
     fn parseSs3(self: *Reader) ?Event {
-        const b = self.readByteIfReady() orelse return .{ .key = .{ .code = .escape } };
+        const b = self.readByteWithin(50) orelse return .{ .key = .{ .code = .escape } };
         return switch (b) {
             'A' => .{ .key = .{ .code = .arrow_up } },
             'B' => .{ .key = .{ .code = .arrow_down } },

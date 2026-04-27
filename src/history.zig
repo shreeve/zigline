@@ -59,21 +59,50 @@ pub const History = struct {
 
         const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
         if (fd < 0) return; // missing history is fine
+        defer _ = std.c.close(fd);
 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
         var chunk: [4096]u8 = undefined;
         while (true) {
             const n = std.c.read(fd, &chunk, chunk.len);
-            if (n < 0) break;
+            if (n < 0) {
+                const e = std.c.errno(@as(c_int, -1));
+                if (e == .INTR or e == .AGAIN) continue;
+                return; // hard read error: keep what we have so far
+            }
             if (n == 0) break;
             try buf.appendSlice(self.allocator, chunk[0..@intCast(n)]);
         }
-        _ = std.c.close(fd);
 
         var it = std.mem.splitScalar(u8, buf.items, '\n');
         while (it.next()) |line| {
             if (line.len == 0) continue;
+            // Apply dedup policy at load time too: with `.adjacent`,
+            // skip a duplicate of the just-loaded prior entry; with
+            // `.all`, drop earlier matches and keep the newest. This
+            // means restarting the editor doesn't resurrect duplicates
+            // that the policy says shouldn't be there.
+            switch (self.options.dedupe) {
+                .none => {},
+                .adjacent => {
+                    if (self.entries.items.len > 0) {
+                        const last = self.entries.items[self.entries.items.len - 1];
+                        if (std.mem.eql(u8, last, line)) continue;
+                    }
+                },
+                .all => {
+                    var i: usize = 0;
+                    while (i < self.entries.items.len) {
+                        if (std.mem.eql(u8, self.entries.items[i], line)) {
+                            self.allocator.free(self.entries.items[i]);
+                            _ = self.entries.orderedRemove(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                },
+            }
             const dup = try self.allocator.dupe(u8, line);
             try self.entries.append(self.allocator, dup);
         }
@@ -161,10 +190,28 @@ pub const History = struct {
         );
         if (fd < 0) return;
         defer _ = std.c.close(fd);
-        _ = std.c.write(fd, line.ptr, line.len);
-        _ = std.c.write(fd, "\n", 1);
+        try writeAllRetry(fd, line);
+        try writeAllRetry(fd, "\n");
     }
 };
+
+/// Loop-on-EINTR-and-partial-write helper for the history file.
+/// `std.c.write` returning a short count is legal POSIX behavior and
+/// the bare append the seed shipped silently truncated lines on a
+/// SIGINT race or filled disk.
+fn writeAllRetry(fd: c_int, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = std.c.write(fd, bytes.ptr + off, bytes.len - off);
+        if (n < 0) {
+            const e = std.c.errno(@as(c_int, -1));
+            if (e == .INTR or e == .AGAIN) continue;
+            return error.WriteFailed;
+        }
+        if (n == 0) return error.UnexpectedEof;
+        off += @intCast(n);
+    }
+}
 
 test "history: append + navigate" {
     var h = try History.init(std.testing.allocator, .{});
@@ -217,4 +264,39 @@ test "history: max_entries prunes oldest" {
     try std.testing.expectEqual(@as(usize, 3), h.entries.items.len);
     try std.testing.expectEqualStrings("b", h.entries.items[0]);
     try std.testing.expectEqualStrings("d", h.entries.items[2]);
+}
+
+test "history: load applies dedup policy" {
+    // Construct a history file by hand with duplicates that an
+    // `.adjacent` policy would reject; load should drop them.
+    const path = "/tmp/zigline_history_load_dedup_test";
+    {
+        const path_z = try std.testing.allocator.dupeZ(u8, path);
+        defer std.testing.allocator.free(path_z);
+        _ = std.c.unlink(path_z.ptr);
+        const fd = std.c.open(
+            path_z.ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
+            @as(std.c.mode_t, 0o600),
+        );
+        try std.testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        const lines = "alpha\nalpha\nbeta\nalpha\n";
+        _ = std.c.write(fd, lines, lines.len);
+    }
+    defer {
+        const path_z = std.testing.allocator.dupeZ(u8, path) catch unreachable;
+        defer std.testing.allocator.free(path_z);
+        _ = std.c.unlink(path_z.ptr);
+    }
+
+    var h = try History.init(std.testing.allocator, .{
+        .path = path,
+        .dedupe = .adjacent,
+    });
+    defer h.deinit();
+    try std.testing.expectEqual(@as(usize, 3), h.entries.items.len);
+    try std.testing.expectEqualStrings("alpha", h.entries.items[0]);
+    try std.testing.expectEqualStrings("beta", h.entries.items[1]);
+    try std.testing.expectEqualStrings("alpha", h.entries.items[2]);
 }

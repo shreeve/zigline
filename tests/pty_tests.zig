@@ -392,6 +392,55 @@ test "pty: history Up arrow recalls last submitted line" {
     try std.testing.expect(count >= 2);
 }
 
+test "pty: bracketed paste end-to-end through readLine" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // Bracketed paste of "hello\nworld" (with embedded newline) should
+    // come through as a single buffer with the newline replaced by a
+    // space, then Enter accepts it.
+    const r = try runScript(alloc, &.{}, &.{
+        .{ .send = "\x1b[200~hello\nworld\x1b[201~\n" },
+        .{ .send = "\x04" },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: hello world") != null);
+}
+
+test "pty: bracketed paste sanitizes invalid UTF-8 to FFFD" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // Paste "a", lone 0xC3 (invalid UTF-8 lead), space, "b" — the
+    // 0xC3 must come out as U+FFFD (\xEF\xBF\xBD).
+    const r = try runScript(alloc, &.{}, &.{
+        .{ .send = "\x1b[200~a\xC3 b\x1b[201~\n" },
+        .{ .send = "\x04" },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "a\xEF\xBF\xBD b") != null);
+}
+
+test "pty: bare ESC does not hang the editor" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // Send ESC, then printable bytes. Without the parser timeout, the
+    // editor would block forever on the next-byte read after ESC.
+    // With the timeout, ESC dispatches as `escape` (no-op in emacs),
+    // then "X" inserts and Enter accepts.
+    const r = try runScript(alloc, &.{}, &.{
+        .{ .send = "\x1b", .settle_ms = 200 }, // give it more than 50ms to time out
+        .{ .send = "X\n" },
+        .{ .send = "\x04" },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: X") != null);
+}
+
 test "pty: completion fills longest common prefix" {
     if (!ptySupported()) return error.SkipZigTest;
 

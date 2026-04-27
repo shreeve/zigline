@@ -48,6 +48,21 @@ pub const Options = struct {
     paste: PastePolicy = .accept,
 };
 
+/// The line editor.
+///
+/// Lifetime: construct with `init`, free with `deinit`. The struct is
+/// **not copyable** — copying duplicates ownership of the internal
+/// allocations (buffer bytes, reader scratch, history snapshots), and
+/// both copies will try to free them. Treat the value returned by
+/// `init` like a `*Editor`: take its address, pass it around as a
+/// pointer.
+///
+/// Thread safety: not thread-safe. One thread per editor instance.
+///
+/// Internal field access: the public fields below are exposed for
+/// advanced cases (e.g. wiring an alternative reader) and to enable
+/// in-tree testing. Treat them as semi-private — invariants between
+/// fields are not always documented and may change between versions.
 pub const Editor = struct {
     allocator: Allocator,
     options: Options,
@@ -55,23 +70,29 @@ pub const Editor = struct {
     terminal: terminal_mod.Terminal,
     renderer: renderer_mod.Renderer,
     reader: input_mod.Reader,
+    /// Used by the cooked-mode (non-TTY) read path to remember the
+    /// "second half" of a CRLF that crossed the boundary between two
+    /// `readLine` invocations.
+    cooked_pending_lf: bool = false,
 
     pub fn init(allocator: Allocator, options: Options) !Editor {
-        var ed: Editor = .{
+        return .{
             .allocator = allocator,
             .options = options,
-            .buffer = buffer_mod.Buffer.init(allocator),
+            .buffer = blk: {
+                var b = buffer_mod.Buffer.init(allocator);
+                b.width_policy = options.width_policy;
+                break :blk b;
+            },
             .terminal = terminal_mod.Terminal.init(options.input_fd, options.output_fd),
-            .renderer = undefined,
+            .renderer = renderer_mod.Renderer.init(allocator, options.width_policy),
             .reader = input_mod.Reader.init(allocator, options.input_fd),
         };
-        ed.buffer.width_policy = options.width_policy;
-        ed.renderer = renderer_mod.Renderer.init(allocator, &ed.terminal, options.width_policy);
-        return ed;
     }
 
     pub fn deinit(self: *Editor) void {
         self.buffer.deinit();
+        self.renderer.deinit();
         self.reader.deinit();
     }
 
@@ -90,25 +111,22 @@ pub const Editor = struct {
         defer if (self.options.raw_mode == .enter_and_leave) self.terminal.leaveRawMode();
 
         self.buffer.clear();
-        self.renderer.invalidate();
+        self.renderer.markFresh();
         try self.render(prompt);
 
         while (true) {
             const ev = self.reader.next();
             switch (ev) {
                 .eof => {
-                    try self.renderer.finalize();
+                    try self.renderer.finalize(&self.terminal);
                     if (self.options.history) |h| h.resetCursor();
                     return .eof;
                 },
                 .error_ => |e| {
-                    try self.renderer.finalize();
+                    try self.renderer.finalize(&self.terminal);
                     return e;
                 },
-                .resize => {
-                    self.renderer.invalidate();
-                    try self.render(prompt);
-                },
+                .resize => try self.render(prompt),
                 .paste => |payload| {
                     try self.handlePaste(payload);
                     try self.render(prompt);
@@ -124,8 +142,16 @@ pub const Editor = struct {
         }
     }
 
+    /// Application hook to signal a terminal resize. Currently a
+    /// no-op: the renderer already queries terminal size on every
+    /// render and detects width changes from cached state, so
+    /// resize is reflected on the next user keystroke. Wiring this
+    /// to actually wake up a blocked `read` requires a self-pipe
+    /// that the read loop polls — that's a v0.2 API addition.
+    /// Documented here as a stable hook so downstream apps don't
+    /// have to change their call sites later.
     pub fn notifyResize(self: *Editor) void {
-        self.renderer.invalidate();
+        _ = self;
     }
 
     // -------------------------------------------------------------------------
@@ -144,7 +170,7 @@ pub const Editor = struct {
                 spans = g;
             }
         }
-        try self.renderer.render(prompt, &self.buffer, spans);
+        try self.renderer.render(&self.terminal, prompt, &self.buffer, spans);
     }
 
     fn handleKey(
@@ -203,7 +229,7 @@ pub const Editor = struct {
             },
             .complete => try self.handleComplete(prompt),
             .accept_line => {
-                try self.renderer.finalize();
+                try self.renderer.finalize(&self.terminal);
                 const out = try self.buffer.take();
                 if (self.options.history) |h| {
                     if (out.len > 0) h.append(out) catch {};
@@ -211,23 +237,29 @@ pub const Editor = struct {
                 return ReadLineResult{ .line = out };
             },
             .cancel_line => {
+                // Move past the rendered block so "^C" doesn't print
+                // mid-prompt when the cursor was on a leading row.
+                try self.renderer.finalize(&self.terminal);
                 try self.terminal.writeAll("^C\r\n");
                 self.buffer.clear();
-                self.renderer.invalidate();
+                self.renderer.markFresh();
                 return ReadLineResult{ .interrupt = {} };
             },
             .eof => {
                 if (self.buffer.isEmpty()) {
-                    try self.renderer.finalize();
+                    try self.renderer.finalize(&self.terminal);
                     return ReadLineResult{ .eof = {} };
                 }
                 try self.buffer.deleteForwardCluster();
             },
             .clear_screen => {
                 try self.terminal.writeAll("\x1b[H\x1b[2J");
-                self.renderer.invalidate();
+                self.renderer.markFresh();
             },
-            .redraw => self.renderer.invalidate(),
+            // `redraw` re-runs the render with current cached state —
+            // the prior block gets cleared row-by-row and rewritten.
+            // Don't markFresh here: we want the climb-and-clear.
+            .redraw => {},
         }
         return null;
     }
@@ -262,6 +294,17 @@ pub const Editor = struct {
             self.allocator.free(result.candidates);
         }
 
+        // Validate the replacement range against the live buffer.
+        // A buggy hook returning out-of-range, inverted, or
+        // mid-cluster bounds must never crash the editor or break
+        // the buffer's UTF-8 / grapheme invariants.
+        const buf_len = self.buffer.bytes.items.len;
+        if (result.replacement_start > result.replacement_end) return;
+        if (result.replacement_end > buf_len) return;
+        try self.buffer.ensureClusters();
+        if (!isClusterBoundary(self.buffer.clusters.items, buf_len, result.replacement_start)) return;
+        if (!isClusterBoundary(self.buffer.clusters.items, buf_len, result.replacement_end)) return;
+
         if (result.candidates.len == 0) return;
 
         if (result.candidates.len == 1) {
@@ -270,20 +313,78 @@ pub const Editor = struct {
         }
 
         // Multiple matches: insert longest common prefix, then list.
-        const common = longestCommonPrefix(result.candidates);
+        const lcp_full = longestCommonPrefix(result.candidates);
+        const common = utf8TruncateToBoundary(lcp_full);
         const current = self.buffer.slice()[result.replacement_start..result.replacement_end];
-        if (common.len > current.len) {
+
+        if (common.len > current.len and std.unicode.utf8ValidateSlice(common)) {
             try self.replaceRangeAt(result.replacement_start, result.replacement_end, common);
         } else {
-            try self.terminal.writeAll("\r\n");
+            // Move past the rendered block so the candidate list
+            // doesn't print mid-prompt when the cursor is on a
+            // leading row of a multi-row buffer.
+            try self.renderer.finalize(&self.terminal);
             for (result.candidates, 0..) |c, i| {
                 const label = c.display orelse c.insert;
-                try self.terminal.writeAll(label);
+                try self.writeCompletionLabel(label);
                 if (i + 1 < result.candidates.len) try self.terminal.writeAll("  ");
             }
             try self.terminal.writeAll("\r\n");
-            self.renderer.invalidate();
+            self.renderer.markFresh();
         }
+    }
+
+    /// Print a candidate's display label, replacing control bytes
+    /// (C0, DEL, and C1) with '?'. Filenames and other user-
+    /// controlled data can embed CSI/ESC bytes — rendering them raw
+    /// would let a malicious filename redraw the user's terminal.
+    /// We also reject bytes 0x80..0x9f (the C1 control range) and
+    /// any byte that isn't valid as part of a UTF-8 sequence we'd
+    /// otherwise pass through; for v0.1 the safe-bytes set is
+    /// 0x20..0x7e plus valid UTF-8 multi-byte runs.
+    fn writeCompletionLabel(self: *Editor, label: []const u8) !void {
+        var safe: std.ArrayListUnmanaged(u8) = .empty;
+        defer safe.deinit(self.allocator);
+        try safe.ensureUnusedCapacity(self.allocator, label.len);
+        var i: usize = 0;
+        while (i < label.len) {
+            const b = label[i];
+            if (b < 0x20 or b == 0x7f) {
+                safe.appendAssumeCapacity('?');
+                i += 1;
+                continue;
+            }
+            if (b < 0x80) {
+                safe.appendAssumeCapacity(b);
+                i += 1;
+                continue;
+            }
+            // Multi-byte UTF-8: validate the whole sequence; if
+            // valid AND the codepoint isn't C1, pass through. C1
+            // (U+0080–U+009F) maps to one '?'.
+            const seq_len = std.unicode.utf8ByteSequenceLength(b) catch {
+                safe.appendAssumeCapacity('?');
+                i += 1;
+                continue;
+            };
+            if (i + seq_len > label.len) {
+                safe.appendAssumeCapacity('?');
+                i += 1;
+                continue;
+            }
+            const cp = std.unicode.utf8Decode(label[i .. i + seq_len]) catch {
+                safe.appendAssumeCapacity('?');
+                i += 1;
+                continue;
+            };
+            if (cp >= 0x80 and cp <= 0x9f) {
+                safe.appendAssumeCapacity('?');
+            } else {
+                safe.appendSliceAssumeCapacity(label[i .. i + seq_len]);
+            }
+            i += seq_len;
+        }
+        try self.terminal.writeAll(safe.items);
     }
 
     fn applyCandidate(
@@ -292,6 +393,15 @@ pub const Editor = struct {
         start: usize,
         end: usize,
     ) !void {
+        // Reject malformed candidates before touching the buffer so
+        // the caller gets either a clean replacement or no change.
+        if (!std.unicode.utf8ValidateSlice(cand.insert)) return;
+        if (cand.append) |c| {
+            // Single-byte append must be ASCII printable to keep the
+            // buffer's UTF-8 invariant; refuse otherwise.
+            if (c >= 0x80 or c < 0x20) return;
+        }
+
         try self.replaceRangeAt(start, end, cand.insert);
         if (cand.append) |c| {
             var b: [1]u8 = .{c};
@@ -316,7 +426,14 @@ pub const Editor = struct {
         self.buffer.cursor_byte = start + text.len;
     }
 
-    /// Cooked-mode read for non-TTY input (pipes, scripts).
+    /// Cooked-mode read for non-TTY input (pipes, scripts). The line
+    /// editor isn't usable here (no escapes, no cursor), but callers
+    /// still want their `readLine` to work end-to-end. We:
+    ///   - normalize \r\n / \r → \n line termination
+    ///   - drop other C0 controls + DEL silently
+    ///   - treat 0x04 (Ctrl-D) on an empty in-progress line as EOF
+    ///   - validate the accepted line as UTF-8 (returns
+    ///     `error.InvalidUtf8` if malformed)
     fn readLineCooked(self: *Editor, prompt: prompt_mod.Prompt) !ReadLineResult {
         try self.terminal.writeAll(prompt.bytes);
         self.buffer.clear();
@@ -325,17 +442,47 @@ pub const Editor = struct {
             const n = std.c.read(self.options.input_fd, &byte, 1);
             if (n < 0) {
                 const e = std.c.errno(@as(c_int, -1));
-                if (e == .INTR) continue;
+                if (e == .INTR or e == .AGAIN) continue;
                 return error.ReadFailed;
             }
             if (n == 0) {
                 if (self.buffer.isEmpty()) return .eof;
-                return ReadLineResult{ .line = try self.buffer.take() };
+                return self.acceptCookedLine();
             }
             const c = byte[0];
-            if (c == '\n') return ReadLineResult{ .line = try self.buffer.take() };
+
+            // If the last `readLine` ended on a `\r` and a `\n` is
+            // queued up, swallow it once and forget. Anything else
+            // resets the flag and proceeds normally.
+            if (self.cooked_pending_lf) {
+                self.cooked_pending_lf = false;
+                if (c == '\n') continue;
+            }
+
+            // CRLF and bare CR both terminate a line as LF does. We
+            // remember a trailing CR so the LF that may follow it on
+            // the next read isn't taken as an extra empty line.
+            if (c == '\r') {
+                self.cooked_pending_lf = true;
+                return self.acceptCookedLine();
+            }
+            if (c == '\n') return self.acceptCookedLine();
+
+            // Ctrl-D on empty line behaves like EOF, matching the
+            // raw-mode keymap. Past that, append; control bytes and
+            // DEL are dropped to keep parity with paste sanitization.
+            if (c == 0x04 and self.buffer.isEmpty()) return .eof;
+            if (c == 0x7f or c < 0x20) continue;
             try self.buffer.bytes.append(self.allocator, c);
         }
+    }
+
+    fn acceptCookedLine(self: *Editor) !ReadLineResult {
+        if (!std.unicode.utf8ValidateSlice(self.buffer.bytes.items)) {
+            self.buffer.clear();
+            return error.InvalidUtf8;
+        }
+        return ReadLineResult{ .line = try self.buffer.take() };
     }
 };
 
@@ -350,6 +497,52 @@ fn longestCommonPrefix(cands: []completion_mod.Candidate) []const u8 {
         if (n == 0) break;
     }
     return cands[0].insert[0..n];
+}
+
+/// True iff `byte_off` is a valid grapheme cluster boundary in the
+/// buffer of length `buf_len` whose clusters are `clusters`. The end-
+/// of-buffer offset is always a boundary; the start is too.
+fn isClusterBoundary(
+    clusters: []const buffer_mod.Cluster,
+    buf_len: usize,
+    byte_off: usize,
+) bool {
+    if (byte_off == 0) return true;
+    if (byte_off == buf_len) return true;
+    for (clusters) |c| {
+        if (c.byte_start == byte_off) return true;
+        if (c.byte_start > byte_off) return false;
+    }
+    return false;
+}
+
+/// Trim `bytes` so it ends on a UTF-8 scalar boundary. The byte-level
+/// LCP can leave us mid-codepoint when two candidates share leading
+/// bytes of different multi-byte chars; inserting that into the
+/// buffer would violate the UTF-8 invariant.
+fn utf8TruncateToBoundary(bytes: []const u8) []const u8 {
+    var i = bytes.len;
+    while (i > 0) {
+        const c = bytes[i - 1];
+        if (c < 0x80) return bytes[0..i]; // ASCII byte; safe boundary after
+        if (c >= 0xC0) {
+            // Lead byte: check whether the run is a complete sequence.
+            const seq_len = std.unicode.utf8ByteSequenceLength(c) catch {
+                i -= 1;
+                continue;
+            };
+            if (i - 1 + seq_len <= bytes.len) {
+                if (std.unicode.utf8Decode(bytes[i - 1 .. i - 1 + seq_len])) |_| {
+                    return bytes[0 .. i - 1 + seq_len];
+                } else |_| {}
+            }
+            i -= 1;
+            continue;
+        }
+        // Continuation byte (0x80-0xBF) — back up further.
+        i -= 1;
+    }
+    return bytes[0..0];
 }
 
 /// Sanitize a bracketed-paste payload before inserting it into the
@@ -407,6 +600,34 @@ test "editor: longestCommonPrefix" {
         .{ .insert = "hex" },
     };
     try std.testing.expectEqualStrings("he", longestCommonPrefix(&cands));
+}
+
+test "editor: utf8TruncateToBoundary keeps complete scalars" {
+    // "café" — last char is 2-byte é (0xC3 0xA9).
+    try std.testing.expectEqualStrings("café", utf8TruncateToBoundary("café"));
+    // Truncated mid-é (only 0xC3) → trim back to "caf".
+    try std.testing.expectEqualStrings("caf", utf8TruncateToBoundary("caf\xC3"));
+    // 3-byte char with only 2 bytes → trim back.
+    try std.testing.expectEqualStrings("a", utf8TruncateToBoundary("a\xE3\x81"));
+    // Pure ASCII unaffected.
+    try std.testing.expectEqualStrings("hello", utf8TruncateToBoundary("hello"));
+    // Empty → empty.
+    try std.testing.expectEqualStrings("", utf8TruncateToBoundary(""));
+}
+
+test "editor: isClusterBoundary catches mid-cluster offsets" {
+    // "café" at byte 4 is mid-é (cluster spans [3, 5)).
+    var b = buffer_mod.Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("café");
+    try b.ensureClusters();
+    const buf_len = b.bytes.items.len;
+
+    try std.testing.expect(isClusterBoundary(b.clusters.items, buf_len, 0));
+    try std.testing.expect(isClusterBoundary(b.clusters.items, buf_len, 1));
+    try std.testing.expect(isClusterBoundary(b.clusters.items, buf_len, 3));
+    try std.testing.expect(isClusterBoundary(b.clusters.items, buf_len, 5));
+    try std.testing.expect(!isClusterBoundary(b.clusters.items, buf_len, 4)); // mid-é
 }
 
 test "editor: sanitizePaste replaces newlines with spaces" {
