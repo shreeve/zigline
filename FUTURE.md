@@ -60,10 +60,6 @@ concrete bullet list.
   `reedline/src/validator/`.
 - **Hints (ghost text).** Right-of-cursor suggestion rendering. Fish-
   style. Reference: `reedline/src/hinter/`.
-- **Undo / redo.** Emacs `C-_` and vi `u`. Reference: `rustyline/src/undo.rs`.
-- **Kill ring with `M-y` yank-pop.** Multi-slot kill history; current
-  Ctrl-W / Ctrl-U / Ctrl-K just discard. Reference: `rustyline/src/kill_ring.rs`,
-  `replxx/src/killring.hxx`.
 - **Numeric arguments.** `M-3 C-f` for "move 3 words." Same machinery
   vi-mode repeat counts will need.
 - **Custom key bindings.** `Keymap` is currently swap-only; expose a
@@ -73,14 +69,10 @@ concrete bullet list.
   whitespace-based; emacs uses `[A-Za-z0-9_]+`; vi has its own.
 - **Completion-while-typing.** Filter candidates as the user types
   more characters. Requires async or at least debounced completion.
-- **Atomic history under concurrent processes.** `persistAppend` is
-  EINTR/partial-write safe but two shells writing the same file race.
-  Reference: `readline/histfile.c` for file-locking, `rustyline/src/history.rs`
-  for tmp+rename.
-- **`dedupe=.all` history-file compaction.** Currently dedup is
-  applied at load and append in memory; the on-disk file still grows
-  duplicates. Periodic atomic rewrite (`tmp + fsync + rename`) would
-  reconcile.
+- **Automatic history compaction.** `History.compact()` exists and
+  is exposed for callers who want to invoke it periodically; consider
+  invoking it automatically on `deinit` or when the file grows past a
+  threshold.
 
 ## API
 

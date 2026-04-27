@@ -62,6 +62,9 @@ fn charLookup(c: u21, mods: input.Modifiers) ?Action {
             'w' => .kill_word_backward,
             'y' => .yank,
             'z' => .suspend_self,
+            // Ctrl-_ is byte 0x1f, which our input parser dispatches
+            // as char='_' with ctrl=true. Standard emacs undo binding.
+            '_' => .undo,
             else => null,
         };
     }

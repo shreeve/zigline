@@ -535,6 +535,37 @@ test "pty: M-y cycles through yank ring" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "got: first") != null);
 }
 
+test "pty: Ctrl-_ undoes typed text" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // Type "hello world", then Ctrl-_ to undo. Coalescing makes
+    // typing one undo step, so a single Ctrl-_ erases the entire
+    // line. Then type "hi" and Enter → expected "hi".
+    const r = try runScript(alloc, &.{}, &.{
+        .{ .send = "hello world\x1fhi\n", .settle_ms = 300 },
+        .{ .send = "\x04", .settle_ms = 300 },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: hi") != null);
+}
+
+test "pty: Ctrl-_ undoes a Ctrl-W kill" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // Type "alpha beta", Ctrl-W (kills "beta"), Ctrl-_ (undo
+    // restores "beta"), Enter. Expected: "alpha beta".
+    const r = try runScript(alloc, &.{}, &.{
+        .{ .send = "alpha beta\x17\x1f\n", .settle_ms = 300 },
+        .{ .send = "\x04", .settle_ms = 300 },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: alpha beta") != null);
+}
+
 test "pty: bare ESC does not hang the editor" {
     if (!ptySupported()) return error.SkipZigTest;
 

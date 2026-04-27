@@ -17,6 +17,13 @@ pub const Cluster = struct {
     width: u8,
 };
 
+/// Result of a single-cluster delete: where the deletion happened
+/// and what bytes were removed (allocator-owned, caller frees).
+pub const DeletedRange = struct {
+    idx: usize,
+    bytes: []u8,
+};
+
 pub const Buffer = struct {
     allocator: Allocator,
     bytes: std.ArrayListUnmanaged(u8) = .empty,
@@ -65,32 +72,34 @@ pub const Buffer = struct {
     }
 
     /// Delete the cluster ending at the cursor. Cursor moves to where
-    /// that cluster started.
-    pub fn deleteBackwardCluster(self: *Buffer) !void {
-        if (self.cursor_byte == 0) return;
+    /// that cluster started. Returns the deletion range so callers
+    /// can record an undo op or push to a kill ring; null at start.
+    pub fn deleteBackwardCluster(self: *Buffer) !?DeletedRange {
+        if (self.cursor_byte == 0) return null;
         try self.ensureClusters();
-        const idx = self.clusterIndexAt(self.cursor_byte) orelse return;
-        if (idx == 0) return;
+        const idx = self.clusterIndexAt(self.cursor_byte) orelse return null;
+        if (idx == 0) return null;
         const prev = self.clusters.items[idx - 1];
-        const remove_start = prev.byte_start;
-        const remove_end = prev.byte_end;
-        const len = remove_end - remove_start;
+        const removed = try self.allocator.dupe(u8, self.bytes.items[prev.byte_start..prev.byte_end]);
+        const len = prev.byte_end - prev.byte_start;
         std.mem.copyForwards(
             u8,
-            self.bytes.items[remove_start..],
-            self.bytes.items[remove_end..],
+            self.bytes.items[prev.byte_start..],
+            self.bytes.items[prev.byte_end..],
         );
         self.bytes.shrinkRetainingCapacity(self.bytes.items.len - len);
-        self.cursor_byte = remove_start;
+        self.cursor_byte = prev.byte_start;
         self.clusters_valid = false;
+        return .{ .idx = prev.byte_start, .bytes = removed };
     }
 
-    pub fn deleteForwardCluster(self: *Buffer) !void {
-        if (self.cursor_byte >= self.bytes.items.len) return;
+    pub fn deleteForwardCluster(self: *Buffer) !?DeletedRange {
+        if (self.cursor_byte >= self.bytes.items.len) return null;
         try self.ensureClusters();
-        const idx = self.clusterIndexAt(self.cursor_byte) orelse return;
-        if (idx >= self.clusters.items.len) return;
+        const idx = self.clusterIndexAt(self.cursor_byte) orelse return null;
+        if (idx >= self.clusters.items.len) return null;
         const cur = self.clusters.items[idx];
+        const removed = try self.allocator.dupe(u8, self.bytes.items[cur.byte_start..cur.byte_end]);
         const len = cur.byte_end - cur.byte_start;
         std.mem.copyForwards(
             u8,
@@ -99,6 +108,7 @@ pub const Buffer = struct {
         );
         self.bytes.shrinkRetainingCapacity(self.bytes.items.len - len);
         self.clusters_valid = false;
+        return .{ .idx = cur.byte_start, .bytes = removed };
     }
 
     pub fn moveLeftCluster(self: *Buffer) !void {
@@ -259,7 +269,10 @@ test "buffer: insert and delete ASCII" {
     try std.testing.expectEqual(@as(usize, 5), b.cursor_byte);
     try std.testing.expectEqualStrings("hello", b.slice());
 
-    try b.deleteBackwardCluster();
+    if (try b.deleteBackwardCluster()) |range| {
+        defer std.testing.allocator.free(range.bytes);
+        try std.testing.expectEqualStrings("o", range.bytes);
+    } else return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("hell", b.slice());
     try std.testing.expectEqual(@as(usize, 4), b.cursor_byte);
 }
@@ -273,7 +286,10 @@ test "buffer: insert UTF-8 stays valid" {
     // 'é' is two bytes in UTF-8; cursor should be at 5 bytes.
     try std.testing.expectEqual(@as(usize, 5), b.cursor_byte);
 
-    try b.deleteBackwardCluster();
+    if (try b.deleteBackwardCluster()) |range| {
+        defer std.testing.allocator.free(range.bytes);
+        try std.testing.expectEqualStrings("é", range.bytes);
+    } else return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("caf", b.slice());
     try std.testing.expectEqual(@as(usize, 3), b.cursor_byte);
 }

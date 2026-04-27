@@ -1,6 +1,6 @@
 .{
     .name = .zigline,
-    .version = "0.1.0",
+    .version = "0.1.3",
     .fingerprint = 0x21cdce3e44b7ce18,
     .minimum_zig_version = "0.16.0",
 

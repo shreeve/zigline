@@ -85,6 +85,11 @@ pub const Keymap = @import("keymap.zig").Keymap;
 /// inspecting the ring contents from a custom action.
 pub const KillRing = @import("kill_ring.zig").KillRing;
 
+/// Per-line undo / redo stack. Owned by `Editor`; reset on each
+/// `accept_line`. Exposed for advanced cases where an application
+/// wants to record extra edits into the same history.
+pub const Changeset = @import("undo.zig").Changeset;
+
 // =============================================================================
 // History
 // =============================================================================
@@ -137,4 +142,5 @@ test {
     _ = @import("highlight.zig");
     _ = @import("prompt.zig");
     _ = @import("kill_ring.zig");
+    _ = @import("undo.zig");
 }

@@ -190,8 +190,65 @@ pub const History = struct {
         );
         if (fd < 0) return;
         defer _ = std.c.close(fd);
+
+        // Advisory whole-file lock so two shells writing the same
+        // history file don't interleave bytes mid-line. The lock
+        // releases automatically on `close(fd)` (the deferred call
+        // above) — even on crash, since the kernel cleans up on
+        // process exit. Best-effort: if flock fails (e.g. on a
+        // filesystem that doesn't support it like NFS-without-lockd),
+        // we proceed unlocked; a torn line is still less bad than
+        // refusing to persist.
+        _ = std.c.flock(fd, std.c.LOCK.EX);
+        defer _ = std.c.flock(fd, std.c.LOCK.UN);
+
         try writeAllRetry(fd, line);
         try writeAllRetry(fd, "\n");
+    }
+
+    /// Atomically rewrite the persistent history file with the
+    /// current in-memory entries (after dedup + max_entries pruning
+    /// have been applied). Used to compact the file when a long-
+    /// running session has accumulated duplicates that the
+    /// `dedupe = .all` policy already removed in memory but couldn't
+    /// remove on disk. Tmp-file + fsync + rename: either the new
+    /// file fully replaces the old one, or the old one survives.
+    pub fn compact(self: *History) !void {
+        const path = self.owned_path orelse return;
+
+        // Build a tmp path adjacent to the real one so rename(2)
+        // stays within the same filesystem (cross-device renames
+        // fail with EXDEV).
+        var tmp_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+        if (path.len + 5 >= tmp_buf.len) return error.PathTooLong;
+        @memcpy(tmp_buf[0..path.len], path);
+        @memcpy(tmp_buf[path.len .. path.len + 5], ".tmpZ");
+        tmp_buf[path.len + 5] = 0;
+        const tmp_z: [*:0]const u8 = @ptrCast(&tmp_buf);
+
+        const tmp_fd = std.c.open(
+            tmp_z,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
+            @as(std.c.mode_t, 0o600),
+        );
+        if (tmp_fd < 0) return error.OpenFailed;
+        var commit = false;
+        defer {
+            _ = std.c.close(tmp_fd);
+            if (!commit) _ = std.c.unlink(tmp_z);
+        }
+
+        for (self.entries.items) |entry| {
+            try writeAllRetry(tmp_fd, entry);
+            try writeAllRetry(tmp_fd, "\n");
+        }
+        // Force the new content to disk before swap.
+        _ = std.c.fsync(tmp_fd);
+
+        const path_z = try self.allocator.dupeZ(u8, path);
+        defer self.allocator.free(path_z);
+        if (std.c.rename(tmp_z, path_z.ptr) != 0) return error.RenameFailed;
+        commit = true;
     }
 };
 
@@ -264,6 +321,41 @@ test "history: max_entries prunes oldest" {
     try std.testing.expectEqual(@as(usize, 3), h.entries.items.len);
     try std.testing.expectEqualStrings("b", h.entries.items[0]);
     try std.testing.expectEqualStrings("d", h.entries.items[2]);
+}
+
+test "history: compact rewrites file with current in-memory entries" {
+    const path = "/tmp/zigline_history_compact_test";
+    {
+        const path_z = try std.testing.allocator.dupeZ(u8, path);
+        defer std.testing.allocator.free(path_z);
+        _ = std.c.unlink(path_z.ptr);
+    }
+    defer {
+        const path_z = std.testing.allocator.dupeZ(u8, path) catch unreachable;
+        defer std.testing.allocator.free(path_z);
+        _ = std.c.unlink(path_z.ptr);
+    }
+
+    var h = try History.init(std.testing.allocator, .{
+        .path = path,
+        .dedupe = .all,
+    });
+    defer h.deinit();
+    try h.append("alpha");
+    try h.append("beta");
+    try h.append("alpha"); // moves "alpha" to the end in memory; file
+                            //    still has the duplicate appended literally
+    try h.compact();
+
+    // Re-open and verify the on-disk file matches the in-memory state.
+    var h2 = try History.init(std.testing.allocator, .{
+        .path = path,
+        .dedupe = .all,
+    });
+    defer h2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), h2.entries.items.len);
+    try std.testing.expectEqualStrings("beta", h2.entries.items[0]);
+    try std.testing.expectEqualStrings("alpha", h2.entries.items[1]);
 }
 
 test "history: load applies dedup policy" {

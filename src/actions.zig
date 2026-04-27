@@ -52,6 +52,11 @@ pub const Action = union(enum) {
     // the deleted text onto the ring; these two pull it back.
     yank,
     yank_pop,
+
+    // Undo / redo within the current line's edit history. Each
+    // `accept_line` clears the history so undo never crosses lines.
+    undo,
+    redo,
 };
 
 pub const DispatchOutcome = union(enum) {

@@ -18,6 +18,7 @@ const kill_ring_mod = @import("kill_ring.zig");
 const prompt_mod = @import("prompt.zig");
 const renderer_mod = @import("renderer.zig");
 const terminal_mod = @import("terminal.zig");
+const undo_mod = @import("undo.zig");
 
 pub const Allocator = std.mem.Allocator;
 
@@ -113,6 +114,7 @@ pub const Editor = struct {
     renderer: renderer_mod.Renderer,
     reader: input_mod.Reader,
     kill_ring: kill_ring_mod.KillRing,
+    changeset: undo_mod.Changeset,
     /// Byte offset of the most-recent yank, so `M-y` (yank-pop) knows
     /// where to splice the replacement. Invalidated by any non-yank
     /// action (the kill ring's `last_action` reset handles that).
@@ -135,6 +137,7 @@ pub const Editor = struct {
             .renderer = renderer_mod.Renderer.init(allocator, options.width_policy),
             .reader = input_mod.Reader.init(allocator, options.input_fd),
             .kill_ring = kill_ring_mod.KillRing.init(allocator, options.kill_ring_capacity),
+            .changeset = undo_mod.Changeset.init(allocator),
         };
     }
 
@@ -143,6 +146,7 @@ pub const Editor = struct {
         self.renderer.deinit();
         self.reader.deinit();
         self.kill_ring.deinit();
+        self.changeset.deinit();
     }
 
     /// Block until the user accepts, cancels, or sends EOF.
@@ -174,6 +178,9 @@ pub const Editor = struct {
         // line) but the next kill won't coalesce with whatever was
         // killed on the previous line.
         self.kill_ring.reset();
+        // Undo history is per-line: starting a new line drops any
+        // leftover edits from the previous one.
+        self.changeset.clear();
         try self.render(prompt);
 
         while (true) {
@@ -251,6 +258,10 @@ pub const Editor = struct {
     };
 
     fn dispatchKill(self: *Editor, kind: KillKind) !void {
+        // Capture cursor position for the undo record before the
+        // kill mutates state; for backward kills the deletion idx
+        // is `cursor - len`, for forward kills it's `cursor`.
+        const cursor_before = self.buffer.cursor_byte;
         const killed_opt: ?[]u8 = switch (kind) {
             .kill_to_start => try self.buffer.killToStart(),
             .kill_to_end => try self.buffer.killToEnd(),
@@ -259,12 +270,17 @@ pub const Editor = struct {
         };
         const killed = killed_opt orelse return;
         defer self.allocator.free(killed);
+
+        const undo_idx = switch (kind) {
+            .kill_to_start, .kill_word_backward => cursor_before - killed.len,
+            .kill_to_end, .kill_word_forward => cursor_before,
+        };
+        try self.changeset.recordDelete(undo_idx, killed);
+
         const mode: kill_ring_mod.Mode = switch (kind) {
             .kill_to_start, .kill_word_backward => .prepend,
             .kill_to_end, .kill_word_forward => .append,
         };
-        // Best-effort push — if the ring's allocator OOMs, we still
-        // completed the deletion correctly.
         self.kill_ring.kill(killed, mode) catch |err| {
             self.diag(.{ .kind = .render_failed, .err = err, .detail = "kill_ring push failed" });
         };
@@ -273,20 +289,75 @@ pub const Editor = struct {
     fn handleYank(self: *Editor) !void {
         const text = self.kill_ring.yank() orelse return;
         self.last_yank_start = self.buffer.cursor_byte;
+        try self.changeset.recordInsert(self.buffer.cursor_byte, text);
         try self.buffer.insertText(text);
     }
 
     fn handleYankPop(self: *Editor) !void {
         const pop = self.kill_ring.yankPop() orelse return;
-        // Replace the just-yanked range with the new text. The yank
-        // landed at `last_yank_start`; its length is `pop.prev_len`.
         const start = self.last_yank_start;
         const end = start + pop.prev_len;
-        if (end > self.buffer.bytes.items.len) return; // sanity guard
+        if (end > self.buffer.bytes.items.len) return;
+        // Record the yank-pop as a delete-then-insert pair so undo
+        // unwinds it cleanly.
+        const old = try self.allocator.dupe(u8, self.buffer.bytes.items[start..end]);
+        defer self.allocator.free(old);
+        try self.changeset.recordDelete(start, old);
+        try self.changeset.recordInsert(start, pop.text);
         try self.replaceRangeAt(start, end, pop.text);
-        // The cursor is now after the replacement; remember the new
-        // start so a subsequent yank-pop replaces it correctly.
         self.last_yank_start = start;
+    }
+
+    fn handleUndo(self: *Editor) !void {
+        const op = self.changeset.popUndo() orelse return;
+        switch (op) {
+            .insert => |e| {
+                // Undo an insert by deleting the same range.
+                const end = e.idx + e.text.len;
+                if (end > self.buffer.bytes.items.len) {
+                    // Buffer drifted; abandon the op rather than
+                    // corrupt state. The op itself is freed below.
+                    self.changeset.allocator.free(e.text);
+                    return;
+                }
+                try self.replaceRangeAt(e.idx, end, "");
+                self.buffer.cursor_byte = e.idx;
+            },
+            .delete => |e| {
+                // Undo a delete by re-inserting at the original idx.
+                if (e.idx > self.buffer.bytes.items.len) {
+                    self.changeset.allocator.free(e.text);
+                    return;
+                }
+                try self.replaceRangeAt(e.idx, e.idx, e.text);
+                self.buffer.cursor_byte = e.idx + e.text.len;
+            },
+        }
+        try self.changeset.commitUndoApplied(op);
+    }
+
+    fn handleRedo(self: *Editor) !void {
+        const op = self.changeset.popRedo() orelse return;
+        switch (op) {
+            .insert => |e| {
+                if (e.idx > self.buffer.bytes.items.len) {
+                    self.changeset.allocator.free(e.text);
+                    return;
+                }
+                try self.replaceRangeAt(e.idx, e.idx, e.text);
+                self.buffer.cursor_byte = e.idx + e.text.len;
+            },
+            .delete => |e| {
+                const end = e.idx + e.text.len;
+                if (end > self.buffer.bytes.items.len) {
+                    self.changeset.allocator.free(e.text);
+                    return;
+                }
+                try self.replaceRangeAt(e.idx, end, "");
+                self.buffer.cursor_byte = e.idx;
+            },
+        }
+        try self.changeset.commitRedoApplied(op);
     }
 
     fn handleKey(
@@ -305,10 +376,11 @@ pub const Editor = struct {
                     // separated only by typing would coalesce into
                     // one slot.
                     self.kill_ring.reset();
-                    try self.insertChar(cp);
+                    try self.insertCharRecorded(cp);
                 },
                 .text => |t| {
                     self.kill_ring.reset();
+                    try self.changeset.recordInsert(self.buffer.cursor_byte, t);
                     try self.buffer.insertText(t);
                 },
                 else => {},
@@ -333,10 +405,41 @@ pub const Editor = struct {
             .yank, .yank_pop => {},
             else => self.kill_ring.reset(),
         }
+        // Cursor moves and other non-edit actions break undo
+        // coalescing too, so the next edit starts a fresh group.
         switch (action) {
-            .insert_text => |t| try self.buffer.insertText(t),
-            .delete_backward => try self.buffer.deleteBackwardCluster(),
-            .delete_forward => try self.buffer.deleteForwardCluster(),
+            .insert_text,
+            .delete_backward,
+            .delete_forward,
+            .kill_to_start,
+            .kill_to_end,
+            .kill_word_backward,
+            .kill_word_forward,
+            .yank,
+            .yank_pop,
+            .complete,
+            .undo,
+            .redo,
+            => {},
+            else => self.changeset.breakSequence(),
+        }
+        switch (action) {
+            .insert_text => |t| {
+                try self.changeset.recordInsert(self.buffer.cursor_byte, t);
+                try self.buffer.insertText(t);
+            },
+            .delete_backward => {
+                if (try self.buffer.deleteBackwardCluster()) |range| {
+                    defer self.allocator.free(range.bytes);
+                    try self.changeset.recordDelete(range.idx, range.bytes);
+                }
+            },
+            .delete_forward => {
+                if (try self.buffer.deleteForwardCluster()) |range| {
+                    defer self.allocator.free(range.bytes);
+                    try self.changeset.recordDelete(range.idx, range.bytes);
+                }
+            },
             .kill_to_start => try self.dispatchKill(.kill_to_start),
             .kill_to_end => try self.dispatchKill(.kill_to_end),
             .kill_word_backward => try self.dispatchKill(.kill_word_backward),
@@ -351,6 +454,11 @@ pub const Editor = struct {
                 if (self.options.history) |h| {
                     if (h.previous(self.buffer.slice())) |entry| {
                         try self.buffer.replaceAll(entry);
+                        // History recall is not part of the line's
+                        // edit history — wipe undo so Ctrl-_ doesn't
+                        // unwind a recalled line into the previous
+                        // one's history.
+                        self.changeset.clear();
                     }
                 }
             },
@@ -358,6 +466,7 @@ pub const Editor = struct {
                 if (self.options.history) |h| {
                     if (h.next()) |entry| {
                         try self.buffer.replaceAll(entry);
+                        self.changeset.clear();
                     }
                 }
             },
@@ -365,6 +474,7 @@ pub const Editor = struct {
             .accept_line => {
                 try self.renderer.finalize(&self.terminal);
                 const out = try self.buffer.take();
+                self.changeset.clear();
                 if (self.options.history) |h| {
                     if (out.len > 0) {
                         h.append(out) catch |err| {
@@ -380,6 +490,7 @@ pub const Editor = struct {
                 try self.renderer.finalize(&self.terminal);
                 try self.terminal.writeAll("^C\r\n");
                 self.buffer.clear();
+                self.changeset.clear();
                 self.renderer.markFresh();
                 return ReadLineResult{ .interrupt = {} };
             },
@@ -388,7 +499,10 @@ pub const Editor = struct {
                     try self.renderer.finalize(&self.terminal);
                     return ReadLineResult{ .eof = {} };
                 }
-                try self.buffer.deleteForwardCluster();
+                if (try self.buffer.deleteForwardCluster()) |range| {
+                    defer self.allocator.free(range.bytes);
+                    try self.changeset.recordDelete(range.idx, range.bytes);
+                }
             },
             .clear_screen => {
                 try self.terminal.writeAll("\x1b[H\x1b[2J");
@@ -401,6 +515,8 @@ pub const Editor = struct {
             .redraw => {},
             .yank => try self.handleYank(),
             .yank_pop => try self.handleYankPop(),
+            .undo => try self.handleUndo(),
+            .redo => try self.handleRedo(),
             .suspend_self => {
                 // Move past the rendered block so the user lands at
                 // a fresh row in their shell, then raise SIGTSTP.
@@ -421,6 +537,13 @@ pub const Editor = struct {
     fn insertChar(self: *Editor, cp: u21) !void {
         var buf: [4]u8 = undefined;
         const len = std.unicode.utf8Encode(cp, &buf) catch return;
+        try self.buffer.insertText(buf[0..len]);
+    }
+
+    fn insertCharRecorded(self: *Editor, cp: u21) !void {
+        var buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(cp, &buf) catch return;
+        try self.changeset.recordInsert(self.buffer.cursor_byte, buf[0..len]);
         try self.buffer.insertText(buf[0..len]);
     }
 
@@ -483,6 +606,7 @@ pub const Editor = struct {
         const current = self.buffer.slice()[result.replacement_start..result.replacement_end];
 
         if (common.len > current.len and std.unicode.utf8ValidateSlice(common)) {
+            try self.recordReplaceForUndo(result.replacement_start, result.replacement_end, common);
             try self.replaceRangeAt(result.replacement_start, result.replacement_end, common);
         } else {
             // Move past the rendered block so the candidate list
@@ -571,11 +695,29 @@ pub const Editor = struct {
             }
         }
 
+        try self.recordReplaceForUndo(start, end, cand.insert);
         try self.replaceRangeAt(start, end, cand.insert);
         if (cand.append) |c| {
             var b: [1]u8 = .{c};
+            try self.changeset.recordInsert(self.buffer.cursor_byte, &b);
             try self.buffer.insertText(&b);
         }
+    }
+
+    /// Record `[start..end] → text` as a paired delete + insert in
+    /// the changeset, so a single undo restores the original text.
+    fn recordReplaceForUndo(
+        self: *Editor,
+        start: usize,
+        end: usize,
+        text: []const u8,
+    ) !void {
+        if (end > start) {
+            const old = try self.allocator.dupe(u8, self.buffer.bytes.items[start..end]);
+            defer self.allocator.free(old);
+            try self.changeset.recordDelete(start, old);
+        }
+        if (text.len > 0) try self.changeset.recordInsert(start, text);
     }
 
     fn replaceRangeAt(
