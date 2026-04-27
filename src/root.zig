@@ -80,6 +80,11 @@ pub const DispatchOutcome = @import("actions.zig").DispatchOutcome;
 /// `KeyEvent → Action` mapping. The default is `Keymap.defaultEmacs()`.
 pub const Keymap = @import("keymap.zig").Keymap;
 
+/// Multi-slot kill ring. Owned by `Editor`; size controlled via
+/// `Options.kill_ring_capacity`. Exposed for advanced use cases like
+/// inspecting the ring contents from a custom action.
+pub const KillRing = @import("kill_ring.zig").KillRing;
+
 // =============================================================================
 // History
 // =============================================================================
@@ -131,4 +136,5 @@ test {
     _ = @import("completion.zig");
     _ = @import("highlight.zig");
     _ = @import("prompt.zig");
+    _ = @import("kill_ring.zig");
 }

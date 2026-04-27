@@ -14,6 +14,7 @@ const highlight_mod = @import("highlight.zig");
 const history_mod = @import("history.zig");
 const input_mod = @import("input.zig");
 const keymap_mod = @import("keymap.zig");
+const kill_ring_mod = @import("kill_ring.zig");
 const prompt_mod = @import("prompt.zig");
 const renderer_mod = @import("renderer.zig");
 const terminal_mod = @import("terminal.zig");
@@ -82,6 +83,11 @@ pub const Options = struct {
     /// debugging surface for embedders. Not called in hot paths
     /// when nothing has gone wrong.
     diagnostic: ?DiagnosticHook = null,
+    /// Number of slots in the kill ring (`Ctrl-K` / `Ctrl-U` /
+    /// `Ctrl-W` / `M-d` push, `Ctrl-Y` yanks, `M-y` cycles). Set to
+    /// 0 to disable kill-ring tracking entirely; the kill actions
+    /// still delete text but won't be recoverable via yank.
+    kill_ring_capacity: usize = 32,
 };
 
 /// The line editor.
@@ -106,6 +112,11 @@ pub const Editor = struct {
     terminal: terminal_mod.Terminal,
     renderer: renderer_mod.Renderer,
     reader: input_mod.Reader,
+    kill_ring: kill_ring_mod.KillRing,
+    /// Byte offset of the most-recent yank, so `M-y` (yank-pop) knows
+    /// where to splice the replacement. Invalidated by any non-yank
+    /// action (the kill ring's `last_action` reset handles that).
+    last_yank_start: usize = 0,
     /// Used by the cooked-mode (non-TTY) read path to remember the
     /// "second half" of a CRLF that crossed the boundary between two
     /// `readLine` invocations.
@@ -123,6 +134,7 @@ pub const Editor = struct {
             .terminal = terminal_mod.Terminal.init(options.input_fd, options.output_fd),
             .renderer = renderer_mod.Renderer.init(allocator, options.width_policy),
             .reader = input_mod.Reader.init(allocator, options.input_fd),
+            .kill_ring = kill_ring_mod.KillRing.init(allocator, options.kill_ring_capacity),
         };
     }
 
@@ -130,6 +142,7 @@ pub const Editor = struct {
         self.buffer.deinit();
         self.renderer.deinit();
         self.reader.deinit();
+        self.kill_ring.deinit();
     }
 
     /// Block until the user accepts, cancels, or sends EOF.
@@ -156,6 +169,11 @@ pub const Editor = struct {
 
         self.buffer.clear();
         self.renderer.markFresh();
+        // Each new line starts with a fresh action chain — old ring
+        // contents are preserved (so M-y still works on the new
+        // line) but the next kill won't coalesce with whatever was
+        // killed on the previous line.
+        self.kill_ring.reset();
         try self.render(prompt);
 
         while (true) {
@@ -222,6 +240,55 @@ pub const Editor = struct {
         if (self.options.diagnostic) |dh| dh.report(d);
     }
 
+    /// Tag identifying which kill operation; controls the kill-ring
+    /// coalescing direction (`.append` for forward kills, `.prepend`
+    /// for backward kills).
+    const KillKind = enum {
+        kill_to_start,
+        kill_to_end,
+        kill_word_backward,
+        kill_word_forward,
+    };
+
+    fn dispatchKill(self: *Editor, kind: KillKind) !void {
+        const killed_opt: ?[]u8 = switch (kind) {
+            .kill_to_start => try self.buffer.killToStart(),
+            .kill_to_end => try self.buffer.killToEnd(),
+            .kill_word_backward => try self.buffer.killWordBackward(),
+            .kill_word_forward => try self.buffer.killWordForward(),
+        };
+        const killed = killed_opt orelse return;
+        defer self.allocator.free(killed);
+        const mode: kill_ring_mod.Mode = switch (kind) {
+            .kill_to_start, .kill_word_backward => .prepend,
+            .kill_to_end, .kill_word_forward => .append,
+        };
+        // Best-effort push — if the ring's allocator OOMs, we still
+        // completed the deletion correctly.
+        self.kill_ring.kill(killed, mode) catch |err| {
+            self.diag(.{ .kind = .render_failed, .err = err, .detail = "kill_ring push failed" });
+        };
+    }
+
+    fn handleYank(self: *Editor) !void {
+        const text = self.kill_ring.yank() orelse return;
+        self.last_yank_start = self.buffer.cursor_byte;
+        try self.buffer.insertText(text);
+    }
+
+    fn handleYankPop(self: *Editor) !void {
+        const pop = self.kill_ring.yankPop() orelse return;
+        // Replace the just-yanked range with the new text. The yank
+        // landed at `last_yank_start`; its length is `pop.prev_len`.
+        const start = self.last_yank_start;
+        const end = start + pop.prev_len;
+        if (end > self.buffer.bytes.items.len) return; // sanity guard
+        try self.replaceRangeAt(start, end, pop.text);
+        // The cursor is now after the replacement; remember the new
+        // start so a subsequent yank-pop replaces it correctly.
+        self.last_yank_start = start;
+    }
+
     fn handleKey(
         self: *Editor,
         kev: input_mod.KeyEvent,
@@ -232,9 +299,18 @@ pub const Editor = struct {
             switch (kev.code) {
                 .char => |cp| {
                     if (cp < 0x20) return null;
+                    // Typing breaks the kill-ring coalescing chain
+                    // exactly like any non-kill action through
+                    // dispatch — without this, two `Ctrl-U` kills
+                    // separated only by typing would coalesce into
+                    // one slot.
+                    self.kill_ring.reset();
                     try self.insertChar(cp);
                 },
-                .text => |t| try self.buffer.insertText(t),
+                .text => |t| {
+                    self.kill_ring.reset();
+                    try self.buffer.insertText(t);
+                },
                 else => {},
             }
             return null;
@@ -248,14 +324,23 @@ pub const Editor = struct {
         action: actions_mod.Action,
         prompt: prompt_mod.Prompt,
     ) !?ReadLineResult {
+        // Any non-kill, non-yank action breaks the kill-ring's
+        // coalescing chain — the next `Ctrl-W` after a cursor move
+        // starts a fresh ring slot rather than appending to the
+        // previous kill.
+        switch (action) {
+            .kill_to_start, .kill_to_end, .kill_word_backward, .kill_word_forward => {},
+            .yank, .yank_pop => {},
+            else => self.kill_ring.reset(),
+        }
         switch (action) {
             .insert_text => |t| try self.buffer.insertText(t),
             .delete_backward => try self.buffer.deleteBackwardCluster(),
             .delete_forward => try self.buffer.deleteForwardCluster(),
-            .kill_to_start => try self.buffer.killToStart(),
-            .kill_to_end => try self.buffer.killToEnd(),
-            .kill_word_backward => try self.buffer.killWordBackward(),
-            .kill_word_forward => try self.buffer.killWordForward(),
+            .kill_to_start => try self.dispatchKill(.kill_to_start),
+            .kill_to_end => try self.dispatchKill(.kill_to_end),
+            .kill_word_backward => try self.dispatchKill(.kill_word_backward),
+            .kill_word_forward => try self.dispatchKill(.kill_word_forward),
             .move_left => try self.buffer.moveLeftCluster(),
             .move_right => try self.buffer.moveRightCluster(),
             .move_word_left => try self.buffer.moveLeftWord(),
@@ -308,11 +393,14 @@ pub const Editor = struct {
             .clear_screen => {
                 try self.terminal.writeAll("\x1b[H\x1b[2J");
                 self.renderer.markFresh();
+                self.kill_ring.reset();
             },
             // `redraw` re-runs the render with current cached state —
             // the prior block gets cleared row-by-row and rewritten.
             // Don't markFresh here: we want the climb-and-clear.
             .redraw => {},
+            .yank => try self.handleYank(),
+            .yank_pop => try self.handleYankPop(),
             .suspend_self => {
                 // Move past the rendered block so the user lands at
                 // a fresh row in their shell, then raise SIGTSTP.

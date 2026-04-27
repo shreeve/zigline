@@ -142,40 +142,60 @@ pub const Buffer = struct {
         self.cursor_byte = self.bytes.items.len;
     }
 
-    pub fn killToStart(self: *Buffer) !void {
-        if (self.cursor_byte == 0) return;
+    /// Delete from cursor backward to start. Returns the killed text
+    /// as an allocator-owned slice (caller frees), or null if the
+    /// cursor was at start. The byte order returned is original
+    /// document order, so callers pushing to a kill ring should use
+    /// `Mode.prepend` to coalesce with later backward-kills.
+    pub fn killToStart(self: *Buffer) !?[]u8 {
+        if (self.cursor_byte == 0) return null;
+        const killed = try self.allocator.dupe(u8, self.bytes.items[0..self.cursor_byte]);
         const remaining = self.bytes.items[self.cursor_byte..];
         std.mem.copyForwards(u8, self.bytes.items[0..remaining.len], remaining);
         self.bytes.shrinkRetainingCapacity(remaining.len);
         self.cursor_byte = 0;
         self.clusters_valid = false;
+        return killed;
     }
 
-    pub fn killToEnd(self: *Buffer) !void {
-        if (self.cursor_byte >= self.bytes.items.len) return;
+    /// Delete from cursor forward to end. Returns the killed text;
+    /// callers should use `Mode.append` for ring coalescing.
+    pub fn killToEnd(self: *Buffer) !?[]u8 {
+        if (self.cursor_byte >= self.bytes.items.len) return null;
+        const killed = try self.allocator.dupe(u8, self.bytes.items[self.cursor_byte..]);
         self.bytes.shrinkRetainingCapacity(self.cursor_byte);
         self.clusters_valid = false;
+        return killed;
     }
 
-    pub fn killWordBackward(self: *Buffer) !void {
-        if (self.cursor_byte == 0) return;
+    /// Delete the word ending at the cursor (skipping any trailing
+    /// separators first). Returns the killed text in document order.
+    pub fn killWordBackward(self: *Buffer) !?[]u8 {
+        if (self.cursor_byte == 0) return null;
         const start_byte = self.cursor_byte;
         var b = self.cursor_byte;
         while (b > 0 and isWordSep(self.bytes.items[b - 1])) b -= 1;
         while (b > 0 and !isWordSep(self.bytes.items[b - 1])) b -= 1;
+        if (b == start_byte) return null;
+        const killed = try self.allocator.dupe(u8, self.bytes.items[b..start_byte]);
         const remaining = self.bytes.items[start_byte..];
         std.mem.copyForwards(u8, self.bytes.items[b..][0..remaining.len], remaining);
         self.bytes.shrinkRetainingCapacity(b + remaining.len);
         self.cursor_byte = b;
         self.clusters_valid = false;
+        return killed;
     }
 
-    pub fn killWordForward(self: *Buffer) !void {
+    /// Delete the word starting at the cursor. Returns killed text;
+    /// callers should use `Mode.append`.
+    pub fn killWordForward(self: *Buffer) !?[]u8 {
         const len = self.bytes.items.len;
-        if (self.cursor_byte >= len) return;
+        if (self.cursor_byte >= len) return null;
         var b = self.cursor_byte;
         while (b < len and isWordSep(self.bytes.items[b])) b += 1;
         while (b < len and !isWordSep(self.bytes.items[b])) b += 1;
+        if (b == self.cursor_byte) return null;
+        const killed = try self.allocator.dupe(u8, self.bytes.items[self.cursor_byte..b]);
         const remaining = self.bytes.items[b..];
         std.mem.copyForwards(
             u8,
@@ -184,6 +204,7 @@ pub const Buffer = struct {
         );
         self.bytes.shrinkRetainingCapacity(self.cursor_byte + remaining.len);
         self.clusters_valid = false;
+        return killed;
     }
 
     /// Replace the entire buffer with `text`. Cursor moves to end.
@@ -309,6 +330,30 @@ test "buffer: killWordBackward over space" {
     defer b.deinit();
 
     try b.insertText("foo bar baz");
-    try b.killWordBackward();
+    if (try b.killWordBackward()) |killed| {
+        defer std.testing.allocator.free(killed);
+        try std.testing.expectEqualStrings("baz", killed);
+    } else return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("foo bar ", b.slice());
+}
+
+test "buffer: killToEnd returns killed text" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+
+    try b.insertText("hello world");
+    b.cursor_byte = 5;
+    if (try b.killToEnd()) |killed| {
+        defer std.testing.allocator.free(killed);
+        try std.testing.expectEqualStrings(" world", killed);
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("hello", b.slice());
+}
+
+test "buffer: killToStart at byte 0 returns null" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("hi");
+    b.cursor_byte = 0;
+    try std.testing.expectEqual(@as(?[]u8, null), try b.killToStart());
 }

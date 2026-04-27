@@ -220,6 +220,15 @@ fn runScriptOn(
     var collected: std.ArrayListUnmanaged(u8) = .empty;
     defer collected.deinit(alloc);
 
+    // Wait for the child to enter raw mode before sending any bytes.
+    // Without this, the harness races the editor's startup: bytes
+    // queued in the PTY's input buffer get processed by the kernel's
+    // cooked-mode line discipline (e.g. Ctrl-W triggers WERASE and
+    // eats a word before zigline ever sees it). zigline emits
+    // `\x1b[?2004h` from `enterRawMode` to enable bracketed paste —
+    // we drain until we see that sentinel, then send the script.
+    try waitForRawMode(&child, alloc, &collected, 2000);
+
     for (steps) |step| {
         if (step.send) |bytes| try child.send(bytes);
         try child.drain(alloc, &collected, step.settle_ms);
@@ -228,6 +237,25 @@ fn runScriptOn(
     try child.drain(alloc, &collected, 1500);
     const status = child.reap();
     return .{ .out = try collected.toOwnedSlice(alloc), .status = status };
+}
+
+fn waitForRawMode(
+    child: *const Spawned,
+    alloc: std.mem.Allocator,
+    collected: *std.ArrayListUnmanaged(u8),
+    deadline_ms: i64,
+) !void {
+    const sentinel = "\x1b[?2004h";
+    var spent: i64 = 0;
+    const slice_ms: i64 = 100;
+    while (spent < deadline_ms) {
+        try child.drain(alloc, collected, slice_ms);
+        if (std.mem.indexOf(u8, collected.items, sentinel) != null) return;
+        spent += slice_ms;
+    }
+    // Fall through: best-effort, the test will probably fail, but
+    // we don't want to lock up if the binary doesn't enter raw mode
+    // (e.g. cooked-mode fallback path).
 }
 
 // =============================================================================
@@ -473,6 +501,38 @@ test "pty: terminal resize wakes the read loop and keeps editing intact" {
 
     try std.testing.expectEqual(@as(u8, 0), status);
     try std.testing.expect(std.mem.indexOf(u8, collected.items, "got: hello world") != null);
+}
+
+test "pty: Ctrl-W then Ctrl-Y restores the killed word" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // Type "alpha beta", Ctrl-W (kills "beta"), Ctrl-Y (yanks it
+    // back), Enter → final buffer is "alpha beta" again.
+    const r = try runScript(alloc, &.{}, &.{
+        .{ .send = "alpha beta\x17\x19\n", .settle_ms = 300 },
+        .{ .send = "\x04", .settle_ms = 300 },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: alpha beta") != null);
+}
+
+test "pty: M-y cycles through yank ring" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // Type "first", Ctrl-U (kills "first" → ring slot 0).
+    // Type "second", Ctrl-U (kills "second" → ring slot 1).
+    // Ctrl-Y (yanks "second"), M-y (cycles to "first"), Enter.
+    // Expected line: "first".
+    const r = try runScript(alloc, &.{}, &.{
+        .{ .send = "first\x15second\x15\x19\x1by\n", .settle_ms = 300 },
+        .{ .send = "\x04", .settle_ms = 300 },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: first") != null);
 }
 
 test "pty: bare ESC does not hang the editor" {

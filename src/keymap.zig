@@ -60,6 +60,7 @@ fn charLookup(c: u21, mods: input.Modifiers) ?Action {
             'p' => .history_prev,
             'u' => .kill_to_start,
             'w' => .kill_word_backward,
+            'y' => .yank,
             'z' => .suspend_self,
             else => null,
         };
@@ -69,6 +70,7 @@ fn charLookup(c: u21, mods: input.Modifiers) ?Action {
             'b' => .move_word_left,
             'f' => .move_word_right,
             'd' => .kill_word_forward,
+            'y' => .yank_pop,
             else => null,
         };
     }

@@ -46,6 +46,12 @@ pub const Action = union(enum) {
     // handler restores cooked termios, re-raises with default
     // disposition, and on resume re-enters raw mode + repaints.
     suspend_self,
+
+    // Kill ring. The kill_* actions above (kill_to_start /
+    // kill_to_end / kill_word_backward / kill_word_forward) push
+    // the deleted text onto the ring; these two pull it back.
+    yank,
+    yank_pop,
 };
 
 pub const DispatchOutcome = union(enum) {
