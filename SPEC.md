@@ -844,6 +844,218 @@ ANSI-emitting function and returns it as a single-span no-op
 (rendering ANSI passthrough). This is documented as a foot-gun and
 discouraged; the spans API is primary.
 
+### §6.5 Multi-column completion menu (v0.2.x)
+
+The v0.x renderer prints multi-candidate completion results on a
+single line, space-separated, beneath the prompt. That's an explicit
+placeholder — works for 3 candidates, broken for 30, unusable for
+300. v0.2.x replaces it with a real menu.
+
+**Defaults** (informed by slash's deployment-style biases — confirmed
+by slash AI's pre-emptive flags):
+
+- **Inline rendering, not alt-screen.** Menu draws below the prompt
+  in the same render region as everything else; on dismiss, the
+  region collapses back to prompt-only. Matches the project's
+  "stay in the same rendered region" feel.
+- **Esc dismisses + restores buffer.** Consistent with the existing
+  cancel-line semantics; navigation can mutate the buffer (preview
+  mode), so Esc must restore.
+- **No new fields on `Candidate`.** The existing `description`
+  covers what icons / kind hints would. Surface stays tight.
+
+**Layout:**
+
+- Equal-width columns, sized to the longest candidate `display`
+  string (or `insert` if no `display`). Column count packs as many
+  as fit in `terminal_cols - 2` (one-cell margin each side for
+  the border indicator).
+- Long candidates truncate with `…` (single-character ellipsis,
+  preserves cluster boundary). No horizontal scroll.
+- Description column rendered to the right of the candidate, in
+  the dim style, only when `description != null` and at least
+  half the terminal width is free after the candidate column.
+  Otherwise omitted (description is informative, not load-bearing).
+- Selected candidate rendered in reverse video.
+
+**Pagination:**
+
+- Page size: `min(candidates.len, max_rows)` where `max_rows`
+  defaults to `min(terminal_rows / 2, 10)` and is configurable via
+  `Options.completion_menu_max_rows`. Conservative default — leaves
+  half the terminal for context.
+- If `candidates.len > max_rows`, render `(N/M)` indicator at
+  bottom-right of menu region and respond to `PageUp`/`PageDown`
+  in addition to per-row navigation.
+
+**Navigation actions while menu is open:**
+
+| Key | Action |
+|---|---|
+| `Tab`, `Down` | next candidate (wraps to first) |
+| `Shift-Tab`, `Up` | previous candidate (wraps to last) |
+| `Left`, `Right` | move column (only meaningful when ≥2 columns) |
+| `PageDown` | next page of candidates |
+| `PageUp` | previous page of candidates |
+| `Home` | first candidate |
+| `End` | last candidate |
+| `Enter` | accept selected candidate, dismiss menu |
+| `Esc` | cancel menu, restore buffer to pre-menu state |
+| any other key | accept selected candidate, dismiss menu, then process the key normally |
+
+The "any other key dismisses + selects" rule is what bash/zsh do:
+typing past the menu commits the current selection and resumes
+editing.
+
+**Buffer preview during navigation:**
+
+The buffer is mutated in-place to show the current selection
+applied — the user sees what each candidate looks like in context.
+`Esc` restores the pre-menu buffer state. `Enter` finalizes (no
+restore). This is more disruptive than "freeze buffer until commit"
+but it's what users expect from inline menus (zsh, fish).
+
+**API additions to `Options`:**
+
+```zig
+pub const Options = struct {
+    // ... existing fields ...
+
+    /// Completion menu config. Null disables the menu (Tab on
+    /// multi-candidate results falls back to the v0.1 single-line
+    /// list — kept as a v0.x escape hatch, removed in v1.0).
+    completion_menu: ?CompletionMenuOptions = .{},
+};
+
+pub const CompletionMenuOptions = struct {
+    /// Maximum candidate rows visible per page. Excess paginates.
+    /// Default: min(terminal_rows / 2, 10).
+    max_rows: ?usize = null,
+    /// Show description column alongside candidates when space
+    /// permits. Default: true.
+    show_descriptions: bool = true,
+};
+```
+
+No additions to `CompletionResult` or `Candidate`. The existing
+shapes carry everything the menu needs.
+
+**Not in scope** (slope guard, same discipline as binding-table's
+§5.1 "not in scope" list):
+
+- Alt-screen menu rendering. Inline only in v0.2.x.
+- Custom menu types behind a trait. zigline ships one menu; if
+  v1.x consumers need IDE-style or list-style menus, that's a
+  separate feature with separate scope.
+- Description popovers / tooltips. Description renders inline or
+  not at all.
+- Fuzzy match scoring / ranking. The hook returns candidates in
+  hook-determined order; the menu displays them as given.
+- Mouse selection. Mouse input is itself a future item.
+- Per-candidate styling beyond the existing `description` field.
+
+**Open questions for slash review** (these specifically benefit
+from real-usage feedback, not abstract preference):
+
+1. **Buffer preview vs frozen buffer.** Default is preview (mutate
+   in-place during nav). Is that the right default for slash users,
+   or would frozen + preview-only-on-Enter be less disruptive?
+   Concrete scenario: long history search where the user is
+   skimming candidates without committing — does preview-mutate
+   feel "responsive" or "thrashing"?
+2. **Page-size default.** `min(rows/2, 10)`. Too small for
+   filesystem completion in deep trees? Too big for short prompts
+   in narrow terminals? Slash usage will reveal.
+3. **Description threshold.** "Show descriptions when ≥ half the
+   terminal width is free after the candidate column." Is half
+   the right cutoff, or is description compression / truncation
+   a better fallback than omission?
+4. **Truncation character.** Default is `…` (single-cluster
+   ellipsis). Some terminals render it weirdly with non-monospace
+   fonts. Should we have a `Options.completion_menu.truncation:
+   []const u8 = "…"` knob, or hold the line on Unicode?
+
+### §6.6 Menu dispatch state machine
+
+When the completion hook returns a multi-candidate result and
+`Options.completion_menu` is non-null, the editor enters menu mode:
+
+```zig
+menu_state: ?MenuState = null,
+
+const MenuState = struct {
+    candidates: []const Candidate,
+    replacement_start: usize,
+    replacement_end: usize,
+    selected_idx: usize,
+    /// Snapshot of the buffer before the menu opened. Restored on
+    /// Esc / cancel.
+    pre_menu_buffer: []u8,
+    pre_menu_cursor: usize,
+};
+```
+
+While `menu_state != null`:
+
+- The keymap is **bypassed**. The dispatcher routes events through
+  a fixed menu-navigation table (the table in §6.5 above). User-
+  defined `lookupFn` and `BindingTable` bindings don't fire.
+- Cursor moves and edits are disabled. The buffer mutates only via
+  the preview-update logic (which replaces `[replacement_start ..
+  replacement_end]` with the selected candidate's `insert` plus
+  any `append` byte).
+- Resize events re-layout the menu but preserve `selected_idx`.
+- Paste events implicitly accept the current selection (per the
+  "any other key" rule), then process the paste. Same shape as a
+  non-navigation key event.
+- EOF / signal events accept the current selection (matching the
+  "any other key" path) before terminating; if the menu was open
+  with no selection (empty candidates — shouldn't happen in
+  practice), they cancel the menu first then proceed.
+
+When the menu dismisses (`Enter` / `Esc` / "any other key"), the
+allocator-owned `pre_menu_buffer` is freed, `menu_state` becomes
+null, and normal dispatch resumes. The cursor position depends on
+the dismissal cause:
+
+- `Enter`: cursor lands at `replacement_start + selected_insert.len + (append ? 1 : 0)`.
+- `Esc`: cursor restored to `pre_menu_cursor`.
+- "any other key": cursor lands as in `Enter`, then the key event
+  is reprocessed against the now-non-menu state.
+
+**Undo recording.** The menu-applied insertion lands as a single
+`Replace` undo step (`pre_menu_buffer` → final buffer). One
+`Ctrl-_` after dismissal unwinds the entire menu interaction.
+
+**Interaction with `Action.complete`.** The keymap maps `Tab` to
+`Action.complete`. When dispatched and the hook returns multiple
+candidates, the editor opens the menu (instead of printing the
+single-line list). When the hook returns one candidate, the
+editor inserts it directly (no menu). When zero, it's a no-op.
+The menu policy is internal to the editor; the hook contract is
+unchanged.
+
+### §6.7 Migration
+
+The completion hook contract (`CompletionHook`, `CompletionRequest`,
+`CompletionResult`, `Candidate`) is unchanged. Consumers don't need
+to update any hook code.
+
+What changes for consumers:
+
+- The single-line space-separated rendering is replaced by the
+  columnar menu when `Options.completion_menu != null` (the
+  default). Consumers who specifically want the v0.1 single-line
+  rendering set `completion_menu = null` (escape hatch, removed in
+  v1.0).
+- New `Options.completion_menu_max_rows` field (default = null,
+  meaning "auto"). Existing `Options{}` literals continue to
+  compile because the default is compatible.
+
+No breaking changes; existing consumer keymaps and hooks work as is.
+The menu is opt-in to the extent that "default-on, can be turned
+off" counts as opt-in.
+
 ---
 
 ## §7 Public API
@@ -1197,12 +1409,14 @@ implementations in `misc/`; both are bounded scope.
   shipped with zigline v0.1.5 embedded; v0.1.6 + v0.2.0 land into
   slash via the same path-dep mechanism with no observed
   regressions.
-- ⏳ **Multi-column completion menu UI**. Replaces the v0.x single-
-  line space-separated placeholder with a columnar layout sized
-  to terminal width, paged for overflow, keyboard-navigable.
-  Reference: `reedline/src/menu/columnar_menu.rs::create_string`.
-  We lift the layout math; we don't lift the trait abstraction
-  (zigline ships one menu type, not three).
+- ⏳ **Multi-column completion menu UI** (designed in §6.5 / §6.6 /
+  §6.7; pending slash review of the four open questions before
+  code lands). Replaces the v0.x single-line space-separated
+  placeholder with a columnar layout sized to terminal width,
+  paged for overflow, keyboard-navigable. Reference:
+  `reedline/src/menu/columnar_menu.rs::create_string`. We lift the
+  layout math; we don't lift the trait abstraction (zigline ships
+  one menu type, not three).
 
 ### v0.x continuing additions (non-breaking)
 
