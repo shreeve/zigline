@@ -270,6 +270,25 @@ pub const Changeset = struct {
         return &self.undos.items[self.undos.items.len - 1];
     }
 
+    /// Reserve capacity for the redo-stack push that `acceptUndo`
+    /// will perform. Call this BEFORE applying the buffer mutation
+    /// so the eventual `acceptUndo` cannot fail with OOM, which
+    /// would leave the buffer mutated but the undo op still on the
+    /// undo stack. After `prepareUndo` returns success, `acceptUndo`
+    /// is guaranteed not to OOM.
+    pub fn prepareUndo(self: *Changeset) !void {
+        if (self.undos.items.len == 0) return;
+        try self.redos.ensureUnusedCapacity(self.allocator, 1);
+    }
+
+    /// Symmetric capacity reservation for the undo-stack push that
+    /// `acceptRedo` performs. Call before applying the redo's
+    /// buffer mutation.
+    pub fn prepareRedo(self: *Changeset) !void {
+        if (self.redos.items.len == 0) return;
+        try self.undos.ensureUnusedCapacity(self.allocator, 1);
+    }
+
     /// Move the most-recent undo entry to the redo stack. Caller
     /// invokes this after successfully applying the op the
     /// `peekUndo` borrowed. Atomic: redo append must succeed before

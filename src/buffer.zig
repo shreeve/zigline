@@ -45,10 +45,42 @@ pub const WordCase = enum {
     lower,
 };
 
+/// Single-line UTF-8 buffer with cluster index and cursor.
+///
+/// **Field-access policy (v1.0 commitment):** the `bytes`,
+/// `clusters`, `cursor_byte`, and `clusters_valid` fields are exposed
+/// `pub` because Zig has no language-level access control, but they
+/// are documented as **low-level**: external callers that mutate them
+/// directly are responsible for preserving the invariants below.
+/// The public API for safe mutation is `insertText`, `replaceAll`,
+/// the `delete*Cluster` / `kill*` family, the `move*` family, and the
+/// in-place transforms (`transposeChars`, `editWord`,
+/// `squeezeWhitespace`). Read-only access via `slice`, `byteLen`,
+/// `isEmpty`. Future zigline versions may move these fields behind a
+/// nested `Internal` struct without a SemVer break — apps using the
+/// accessor API keep working; apps mutating fields directly should
+/// expect to migrate.
+///
+/// **Invariants:**
+///   - `bytes` is always valid UTF-8 (enforced by `insertText` and
+///     `replaceAll`; external content paths sanitize via
+///     `findUnsafeByte` to also reject control bytes).
+///   - `cursor_byte` sits on a grapheme-cluster boundary or at
+///     `bytes.len` (one past the last cluster). Cluster-aware
+///     methods rely on this.
+///   - `clusters_valid` is `true` iff `clusters` reflects the
+///     current `bytes` content. Edit methods invalidate; renders
+///     re-segment via `ensureClusters`.
 pub const Buffer = struct {
     allocator: Allocator,
+    /// **Low-level.** Backing UTF-8 bytes. See type-level doc.
     bytes: std.ArrayListUnmanaged(u8) = .empty,
+    /// **Low-level.** Cluster index; valid only when `clusters_valid`
+    /// is true. Recomputed on demand by `ensureClusters`.
     clusters: std.ArrayListUnmanaged(Cluster) = .empty,
+    /// **Low-level.** Cursor byte offset; must sit on a cluster
+    /// boundary. The accessor `cursorByte()` is the read API; for
+    /// safe writes use the `move*` family or `setCursorByteAtClusterBoundary`.
     cursor_byte: usize = 0,
     clusters_valid: bool = false,
     width_policy: grapheme.WidthPolicy = .{},
@@ -68,6 +100,41 @@ pub const Buffer = struct {
 
     pub fn isEmpty(self: *const Buffer) bool {
         return self.bytes.items.len == 0;
+    }
+
+    /// Buffer size in bytes (not graphemes / not display columns).
+    /// Stable v1.0 surface — promised by STABILITY.md.
+    pub fn byteLen(self: *const Buffer) usize {
+        return self.bytes.items.len;
+    }
+
+    /// Cursor byte offset. Always sits on a grapheme-cluster boundary
+    /// or at `byteLen()`. Stable v1.0 surface; prefer this over
+    /// reading `cursor_byte` directly so future internal moves don't
+    /// break callers.
+    pub fn cursorByte(self: *const Buffer) usize {
+        return self.cursor_byte;
+    }
+
+    /// Set the cursor at a verified cluster boundary. Returns
+    /// `error.NotClusterBoundary` if `byte` doesn't land on one
+    /// (re-segments if needed). Use this instead of writing
+    /// `cursor_byte` directly to preserve the invariant.
+    pub fn setCursorByteAtClusterBoundary(self: *Buffer, byte: usize) !void {
+        if (byte > self.bytes.items.len) return error.OutOfBounds;
+        try self.ensureClusters();
+        if (byte == self.bytes.items.len) {
+            self.cursor_byte = byte;
+            return;
+        }
+        for (self.clusters.items) |c| {
+            if (c.byte_start == byte) {
+                self.cursor_byte = byte;
+                return;
+            }
+            if (c.byte_start > byte) return error.NotClusterBoundary;
+        }
+        return error.NotClusterBoundary;
     }
 
     /// Recompute cluster boundaries if the bytes have changed since
@@ -393,6 +460,30 @@ fn isWordSep(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '/' or c == ':';
 }
 
+/// Scan `text` for bytes that aren't safe to land in the single-line
+/// UTF-8 buffer model. Returns the offset of the first unsafe byte,
+/// or null if all bytes are safe. Does NOT validate UTF-8 — combine
+/// with `std.unicode.utf8ValidateSlice` for a complete check.
+///
+/// Unsafe bytes:
+///   - C0 controls (0x00..0x1F): includes `\r` and `\n` (which would
+///     break the single-line invariant), `\x1b` ESC (which would
+///     inject ANSI sequences into the rendered output), `\x07` BEL,
+///     and the rest.
+///   - DEL (0x7F).
+///
+/// Quoted-insert (Ctrl-V / Ctrl-Q) is the documented escape hatch
+/// for typing literal control bytes interactively. This function is
+/// for sanitizing **external** content (completion candidates,
+/// history entries, custom-action insertions, paste payloads) before
+/// it enters the buffer — the editor uses it at every hook boundary.
+pub fn findUnsafeByte(text: []const u8) ?usize {
+    for (text, 0..) |b, i| {
+        if (b < 0x20 or b == 0x7f) return i;
+    }
+    return null;
+}
+
 /// Horizontal whitespace only — what `M-\` (squeeze) targets.
 /// Distinct from `isWordSep` because newlines and word-internal
 /// separators like `/` and `:` shouldn't be squeezed.
@@ -683,4 +774,45 @@ test "buffer: squeezeWhitespace preserves newlines (only horizontal ws)" {
     const r = try b.squeezeWhitespace();
     try std.testing.expectEqual(@as(?EditResult, null), r);
     try std.testing.expectEqualStrings("a\nb", b.slice());
+}
+
+test "buffer: findUnsafeByte catches C0, DEL, ESC, newlines" {
+    try std.testing.expectEqual(@as(?usize, null), findUnsafeByte("hello world"));
+    try std.testing.expectEqual(@as(?usize, null), findUnsafeByte(""));
+    try std.testing.expectEqual(@as(?usize, null), findUnsafeByte("café"));
+    try std.testing.expectEqual(@as(?usize, 5), findUnsafeByte("hello\nworld"));
+    try std.testing.expectEqual(@as(?usize, 5), findUnsafeByte("hello\rworld"));
+    try std.testing.expectEqual(@as(?usize, 0), findUnsafeByte("\x1b[2J"));
+    try std.testing.expectEqual(@as(?usize, 3), findUnsafeByte("foo\x07bar"));
+    try std.testing.expectEqual(@as(?usize, 3), findUnsafeByte("foo\x7fbar"));
+    // Tab is currently unsafe (no tab-rendering support yet).
+    try std.testing.expectEqual(@as(?usize, 1), findUnsafeByte("a\tb"));
+}
+
+test "buffer: byteLen matches insertText growth" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try std.testing.expectEqual(@as(usize, 0), b.byteLen());
+    try b.insertText("hello");
+    try std.testing.expectEqual(@as(usize, 5), b.byteLen());
+    try b.insertText("é"); // 2-byte UTF-8
+    try std.testing.expectEqual(@as(usize, 7), b.byteLen());
+}
+
+test "buffer: cursorByte + setCursorByteAtClusterBoundary" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("café");
+    try std.testing.expectEqual(b.byteLen(), b.cursorByte());
+
+    // 0, 1, 2, 3 (start of é), 5 (end) are valid; 4 is mid-cluster.
+    try b.setCursorByteAtClusterBoundary(0);
+    try std.testing.expectEqual(@as(usize, 0), b.cursorByte());
+    try b.setCursorByteAtClusterBoundary(3);
+    try std.testing.expectEqual(@as(usize, 3), b.cursorByte());
+    try b.setCursorByteAtClusterBoundary(5);
+    try std.testing.expectEqual(@as(usize, 5), b.cursorByte());
+
+    try std.testing.expectError(error.NotClusterBoundary, b.setCursorByteAtClusterBoundary(4));
+    try std.testing.expectError(error.OutOfBounds, b.setCursorByteAtClusterBoundary(99));
 }

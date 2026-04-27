@@ -51,6 +51,18 @@ pub const Diagnostic = struct {
         highlight_hook_failed,
         history_append_failed,
         render_failed,
+        // Custom-action paths get their own kinds so apps can route
+        // them distinctly from completion failures (which is how they
+        // were categorized pre-v1.0). `Diagnostic.Kind` is in the
+        // "experimental in v1.x" set — see STABILITY.md — so adding
+        // variants is non-breaking, but apps that switched on the
+        // earlier names should add cases for these.
+        custom_action_failed,
+        custom_action_invalid_text,
+        // Internal-mutation paths that were previously reported as
+        // `.render_failed` for lack of a better category.
+        undo_record_failed,
+        kill_ring_failed,
     };
 
     kind: Kind,
@@ -92,13 +104,26 @@ pub const CustomActionContext = struct {
     /// stdin/stdout (an editor, pager, password prompt). Pairs with
     /// `resumeRawMode`. Idempotent: calling twice is safe.
     ///
-    /// No-op when the input fd isn't a TTY (cooked-mode read path).
-    /// Raw mode is meaningless without a TTY, so there's nothing to
-    /// pause; helpers like `withCookedMode` still work in this mode.
+    /// No-op when:
+    ///   - The input fd isn't a TTY (cooked-mode read path; no raw
+    ///     mode to pause).
+    ///   - Zigline doesn't own raw mode (`Options.raw_mode ==
+    ///     .assume_already_raw` — caller manages termios). Stomping
+    ///     on caller-owned state would corrupt their save/restore.
+    ///     Apps in `.assume_already_raw` that want to bracket a
+    ///     spawn should bracket it in their own termios save /
+    ///     restore around the custom action.
     pub fn pauseRawMode(self: CustomActionContext) !void {
         if (!self.editor.terminal.isInputTty()) return;
+        if (!self.editor.owns_raw_mode) return;
         try self.editor.renderer.finalize(&self.editor.terminal);
+        // `leaveRawMode` uninstalls the signal-guard and closes the
+        // self-pipe. The reader holds the read-end of that pipe;
+        // detach so polls don't fire on a closed fd. Re-attached in
+        // `resumeRawMode`.
+        self.editor.reader.setSignalPipe(-1);
         self.editor.terminal.leaveRawMode();
+        self.editor.owns_raw_mode = false;
     }
 
     /// Re-enter raw mode after `pauseRawMode`. Marks the renderer
@@ -108,11 +133,22 @@ pub const CustomActionContext = struct {
     /// the spawned process exited with a newline if visual layout
     /// matters.
     ///
-    /// No-op when the input fd isn't a TTY — symmetric with
-    /// `pauseRawMode`.
+    /// No-op symmetric with `pauseRawMode`: if the input fd isn't a
+    /// TTY, OR if zigline never owned raw mode in this `readLine`
+    /// (i.e. `pauseRawMode` was a no-op too), `resumeRawMode` is
+    /// also a no-op.
     pub fn resumeRawMode(self: CustomActionContext) !void {
         if (!self.editor.terminal.isInputTty()) return;
+        // If zigline already owns raw mode, calling enterRawMode
+        // again is harmless (it's idempotent), but we want resume to
+        // exactly mirror pause — only bring up raw mode if we just
+        // tore it down.
+        if (self.editor.options.raw_mode != .enter_and_leave) return;
+        if (self.editor.owns_raw_mode) return; // pause was a no-op
         try self.editor.terminal.enterRawMode();
+        self.editor.owns_raw_mode = true;
+        // Re-attach the reader to the freshly-installed signal pipe.
+        self.editor.reader.setSignalPipe(self.editor.terminal.signalPipeFd());
         self.editor.renderer.markFresh();
     }
 
@@ -145,7 +181,7 @@ pub const CustomActionContext = struct {
         const result = func(context) catch |err| {
             self.resumeRawMode() catch |re| {
                 self.editor.diag(.{
-                    .kind = .render_failed,
+                    .kind = .custom_action_failed,
                     .err = re,
                     .detail = "withCookedMode: resumeRawMode failed after func error",
                 });
@@ -278,6 +314,16 @@ pub const Editor = struct {
     /// "second half" of a CRLF that crossed the boundary between two
     /// `readLine` invocations.
     cooked_pending_lf: bool = false,
+    /// True when zigline itself entered raw mode for the active
+    /// `readLine` (`Options.raw_mode == .enter_and_leave`). Set in
+    /// `readLine` after `enterRawMode` succeeds; cleared on the
+    /// matching `leaveRawMode`. Used to gate operations that only
+    /// make sense when zigline owns the termios lifecycle:
+    /// `pauseRawMode` / `resumeRawMode` (no-op otherwise so they
+    /// don't trample caller-managed state under `.assume_already_raw`)
+    /// and `suspend_self` (which assumes the SIGTSTP handler is
+    /// installed, only true under `.enter_and_leave`).
+    owns_raw_mode: bool = false,
     /// `quoted_insert` (`Ctrl-V` / `Ctrl-Q`) primes this flag; the
     /// next key event is then inserted literally regardless of any
     /// keymap binding it would otherwise trigger.
@@ -331,10 +377,14 @@ pub const Editor = struct {
 
         if (self.options.raw_mode == .enter_and_leave) {
             try self.terminal.enterRawMode();
+            self.owns_raw_mode = true;
         }
         defer {
             self.reader.setSignalPipe(-1);
-            if (self.options.raw_mode == .enter_and_leave) self.terminal.leaveRawMode();
+            if (self.options.raw_mode == .enter_and_leave) {
+                self.terminal.leaveRawMode();
+                self.owns_raw_mode = false;
+            }
         }
 
         // Wire the signal self-pipe into the reader so SIGWINCH /
@@ -354,6 +404,14 @@ pub const Editor = struct {
         self.changeset.clear();
         // Multi-key sequences shouldn't survive a `readLine` boundary.
         self.pending_keys.clearRetainingCapacity();
+        // Per-line state that pre-v0.2.x carried across `readLine`
+        // calls: a quoted-insert primed mid-line and then aborted via
+        // EOF/cancel would treat the next line's first key as
+        // literal; yank-last-arg cycle state likewise leaked. Reset
+        // them all so each `readLine` starts clean.
+        self.quoted_insert_pending = false;
+        self.yank_last_arg = null;
+        self.last_yank_start = 0;
         try self.render(prompt);
 
         while (true) {
@@ -465,7 +523,7 @@ pub const Editor = struct {
             .kill_to_end, .kill_word_forward => .append,
         };
         self.kill_ring.kill(killed, mode) catch |err| {
-            self.diag(.{ .kind = .render_failed, .err = err, .detail = "kill_ring push failed" });
+            self.diag(.{ .kind = .kill_ring_failed, .err = err, .detail = "kill_ring push failed" });
         };
     }
 
@@ -498,6 +556,11 @@ pub const Editor = struct {
 
     fn handleUndo(self: *Editor) !void {
         const op_ptr = self.changeset.peekUndo() orelse return;
+        // Reserve redo-stack capacity BEFORE applying the buffer
+        // mutation. Without this, an OOM in `acceptUndo`'s redo push
+        // leaves the buffer mutated while the undo op stays on the
+        // undo stack — the next undo would wrongly re-apply.
+        try self.changeset.prepareUndo();
         // Apply on a stack-local copy of the op fields so the borrow
         // stays valid even if `replaceRangeAt` would (somehow)
         // observe stack state.
@@ -525,12 +588,15 @@ pub const Editor = struct {
         // already mutated but the op stays on undos — best-effort
         // degradation that's strictly better than a leak.
         self.changeset.acceptUndo() catch |err| {
-            self.diag(.{ .kind = .render_failed, .err = err, .detail = "acceptUndo failed" });
+            self.diag(.{ .kind = .undo_record_failed, .err = err, .detail = "acceptUndo failed" });
         };
     }
 
     fn handleRedo(self: *Editor) !void {
         const op_ptr = self.changeset.peekRedo() orelse return;
+        // Symmetric to `handleUndo` — reserve undo-stack capacity
+        // before mutating so `acceptRedo` is OOM-safe.
+        try self.changeset.prepareRedo();
         const op = op_ptr.*;
         switch (op) {
             .insert => |e| {
@@ -552,7 +618,7 @@ pub const Editor = struct {
             },
         }
         self.changeset.acceptRedo() catch |err| {
-            self.diag(.{ .kind = .render_failed, .err = err, .detail = "acceptRedo failed" });
+            self.diag(.{ .kind = .undo_record_failed, .err = err, .detail = "acceptRedo failed" });
         };
     }
 
@@ -576,6 +642,39 @@ pub const Editor = struct {
         // post-swap end. Both are correct.
         const cursor_before = r.start + r.old_bytes.len;
         self.recordReplaceOrDiag(r.start, r.old_bytes, r.new_bytes, cursor_before, cursor_after);
+    }
+
+    /// Delete the cluster at the cursor and record an undo step.
+    /// Shared between the `.delete_forward` action arm and the `.eof`
+    /// arm's "delete-cluster on non-empty buffer" path.
+    fn deleteForwardRecorded(self: *Editor) !void {
+        const cursor_before = self.buffer.cursor_byte;
+        if (try self.buffer.deleteForwardCluster()) |range| {
+            defer self.allocator.free(range.bytes);
+            self.recordDeleteOrDiag(range.idx, range.bytes, cursor_before, self.buffer.cursor_byte);
+        }
+    }
+
+    /// Direction selector for `recallFromHistory`. Mirrors the four
+    /// `History` navigation methods.
+    const HistoryDir = enum { prev, next, first, last };
+
+    /// Pull a history entry into the buffer and clear the per-line
+    /// changeset. Recalling history isn't part of the line's edit
+    /// history — Ctrl-_ shouldn't unwind a recalled line into the
+    /// previous one's history.
+    fn recallFromHistory(self: *Editor, dir: HistoryDir) !void {
+        const h = self.options.history orelse return;
+        const entry_opt: ?[]const u8 = switch (dir) {
+            .prev => h.previous(self.buffer.slice()),
+            .next => h.next(),
+            .first => h.first(self.buffer.slice()),
+            .last => h.last(),
+        };
+        if (entry_opt) |entry| {
+            try self.buffer.replaceAll(entry);
+            self.changeset.clear();
+        }
     }
 
     fn handleYankLastArg(self: *Editor) !void {
@@ -630,7 +729,7 @@ pub const Editor = struct {
             },
             .{ .editor = self },
         ) catch |err| {
-            self.diag(.{ .kind = .completion_hook_failed, .err = err, .detail = "custom_action hook failed" });
+            self.diag(.{ .kind = .custom_action_failed, .err = err, .detail = "custom_action hook failed" });
             return null;
         };
 
@@ -639,7 +738,11 @@ pub const Editor = struct {
             .insert_text => |t| {
                 defer self.allocator.free(t);
                 if (!std.unicode.utf8ValidateSlice(t)) {
-                    self.diag(.{ .kind = .completion_invalid_candidate, .detail = "custom_action insert_text not UTF-8" });
+                    self.diag(.{ .kind = .custom_action_invalid_text, .detail = "custom_action insert_text not UTF-8" });
+                    return null;
+                }
+                if (buffer_mod.findUnsafeByte(t) != null) {
+                    self.diag(.{ .kind = .custom_action_invalid_text, .detail = "custom_action insert_text contains control bytes" });
                     return null;
                 }
                 if (t.len == 0) return null;
@@ -653,7 +756,11 @@ pub const Editor = struct {
             .replace_buffer => |t| {
                 defer self.allocator.free(t);
                 if (!std.unicode.utf8ValidateSlice(t)) {
-                    self.diag(.{ .kind = .completion_invalid_candidate, .detail = "custom_action replace_buffer not UTF-8" });
+                    self.diag(.{ .kind = .custom_action_invalid_text, .detail = "custom_action replace_buffer not UTF-8" });
+                    return null;
+                }
+                if (buffer_mod.findUnsafeByte(t) != null) {
+                    self.diag(.{ .kind = .custom_action_invalid_text, .detail = "custom_action replace_buffer contains control bytes" });
                     return null;
                 }
                 const old = try self.allocator.dupe(u8, self.buffer.slice());
@@ -712,7 +819,7 @@ pub const Editor = struct {
         cursor_after: usize,
     ) void {
         self.changeset.recordInsert(idx, text, cursor_before, cursor_after) catch |err| {
-            self.diag(.{ .kind = .render_failed, .err = err, .detail = "undo record (insert) failed" });
+            self.diag(.{ .kind = .undo_record_failed, .err = err, .detail = "undo record (insert) failed" });
         };
     }
 
@@ -724,7 +831,7 @@ pub const Editor = struct {
         cursor_after: usize,
     ) void {
         self.changeset.recordDelete(idx, text, cursor_before, cursor_after) catch |err| {
-            self.diag(.{ .kind = .render_failed, .err = err, .detail = "undo record (delete) failed" });
+            self.diag(.{ .kind = .undo_record_failed, .err = err, .detail = "undo record (delete) failed" });
         };
     }
 
@@ -737,7 +844,7 @@ pub const Editor = struct {
         cursor_after: usize,
     ) void {
         self.changeset.recordReplace(idx, old, new, cursor_before, cursor_after) catch |err| {
-            self.diag(.{ .kind = .render_failed, .err = err, .detail = "undo record (replace) failed" });
+            self.diag(.{ .kind = .undo_record_failed, .err = err, .detail = "undo record (replace) failed" });
         };
     }
 
@@ -810,12 +917,24 @@ pub const Editor = struct {
                     // exactly like any non-kill action through
                     // dispatch — without this, two `Ctrl-U` kills
                     // separated only by typing would coalesce into
-                    // one slot.
+                    // one slot. Same logic for `yank_last_arg`
+                    // cycling: any non-yank-last-arg event ends the
+                    // cycle, including default-inserted text.
                     self.kill_ring.reset();
+                    self.yank_last_arg = null;
                     try self.insertCharRecorded(cp);
                 },
                 .text => |t| {
+                    // `.text` is an input-layer event for paste-like
+                    // chunks. The built-in `Reader` doesn't emit it
+                    // today, but `KeyEvent` is public so custom
+                    // readers might. Apply the same single-line +
+                    // control-byte policy as everything else
+                    // entering the buffer through this path.
+                    if (!std.unicode.utf8ValidateSlice(t)) return null;
+                    if (buffer_mod.findUnsafeByte(t) != null) return null;
                     self.kill_ring.reset();
+                    self.yank_last_arg = null;
                     const cursor_before = self.buffer.cursor_byte;
                     try self.buffer.insertText(t);
                     self.recordInsertOrDiag(cursor_before, t, cursor_before, self.buffer.cursor_byte);
@@ -924,9 +1043,21 @@ pub const Editor = struct {
         if (action != .yank_last_arg) self.yank_last_arg = null;
         switch (action) {
             .insert_text => |t| {
-                const cursor_before = self.buffer.cursor_byte;
-                try self.buffer.insertText(t);
-                self.recordInsertOrDiag(cursor_before, t, cursor_before, self.buffer.cursor_byte);
+                // Even action-supplied text must pass the buffer's
+                // single-line + control-byte policy. Apps that need
+                // to type literal control bytes use quoted-insert,
+                // not Action.insert_text. Failures route to the
+                // diagnostic hook and are treated as no-op so a
+                // single bad action doesn't crash the read loop.
+                if (!std.unicode.utf8ValidateSlice(t)) {
+                    self.diag(.{ .kind = .completion_invalid_candidate, .detail = "Action.insert_text not valid UTF-8" });
+                } else if (buffer_mod.findUnsafeByte(t) != null) {
+                    self.diag(.{ .kind = .completion_invalid_candidate, .detail = "Action.insert_text contains control bytes" });
+                } else {
+                    const cursor_before = self.buffer.cursor_byte;
+                    try self.buffer.insertText(t);
+                    self.recordInsertOrDiag(cursor_before, t, cursor_before, self.buffer.cursor_byte);
+                }
             },
             .delete_backward => {
                 const cursor_before = self.buffer.cursor_byte;
@@ -935,13 +1066,7 @@ pub const Editor = struct {
                     self.recordDeleteOrDiag(range.idx, range.bytes, cursor_before, self.buffer.cursor_byte);
                 }
             },
-            .delete_forward => {
-                const cursor_before = self.buffer.cursor_byte;
-                if (try self.buffer.deleteForwardCluster()) |range| {
-                    defer self.allocator.free(range.bytes);
-                    self.recordDeleteOrDiag(range.idx, range.bytes, cursor_before, self.buffer.cursor_byte);
-                }
-            },
+            .delete_forward => try self.deleteForwardRecorded(),
             .kill_to_start => try self.dispatchKill(.kill_to_start),
             .kill_to_end => try self.dispatchKill(.kill_to_end),
             .kill_word_backward => try self.dispatchKill(.kill_word_backward),
@@ -952,42 +1077,10 @@ pub const Editor = struct {
             .move_word_right => try self.buffer.moveRightWord(),
             .move_to_start => self.buffer.moveToStart(),
             .move_to_end => self.buffer.moveToEnd(),
-            .history_prev => {
-                if (self.options.history) |h| {
-                    if (h.previous(self.buffer.slice())) |entry| {
-                        try self.buffer.replaceAll(entry);
-                        // History recall is not part of the line's
-                        // edit history — wipe undo so Ctrl-_ doesn't
-                        // unwind a recalled line into the previous
-                        // one's history.
-                        self.changeset.clear();
-                    }
-                }
-            },
-            .history_next => {
-                if (self.options.history) |h| {
-                    if (h.next()) |entry| {
-                        try self.buffer.replaceAll(entry);
-                        self.changeset.clear();
-                    }
-                }
-            },
-            .history_first => {
-                if (self.options.history) |h| {
-                    if (h.first(self.buffer.slice())) |entry| {
-                        try self.buffer.replaceAll(entry);
-                        self.changeset.clear();
-                    }
-                }
-            },
-            .history_last => {
-                if (self.options.history) |h| {
-                    if (h.last()) |entry| {
-                        try self.buffer.replaceAll(entry);
-                        self.changeset.clear();
-                    }
-                }
-            },
+            .history_prev => try self.recallFromHistory(.prev),
+            .history_next => try self.recallFromHistory(.next),
+            .history_first => try self.recallFromHistory(.first),
+            .history_last => try self.recallFromHistory(.last),
             .yank_last_arg => try self.handleYankLastArg(),
             .complete => try self.handleComplete(prompt),
             .accept_line => return try self.acceptCurrentLine(),
@@ -997,11 +1090,7 @@ pub const Editor = struct {
                     try self.renderer.finalize(&self.terminal);
                     return ReadLineResult{ .eof = {} };
                 }
-                const cursor_before = self.buffer.cursor_byte;
-                if (try self.buffer.deleteForwardCluster()) |range| {
-                    defer self.allocator.free(range.bytes);
-                    self.recordDeleteOrDiag(range.idx, range.bytes, cursor_before, self.buffer.cursor_byte);
-                }
+                try self.deleteForwardRecorded();
             },
             .clear_screen => {
                 try self.terminal.writeAll("\x1b[H\x1b[2J");
@@ -1031,6 +1120,21 @@ pub const Editor = struct {
                 // self-pipe. The next reader.next() picks up the
                 // pipe wake and returns .resize, which triggers a
                 // render — visually identical to a SIGWINCH.
+                //
+                // Gated on `owns_raw_mode` AND a successfully
+                // installed signal-guard: under `.assume_already_raw`
+                // we don't have a SIGTSTP handler to restore termios
+                // before stop, and if `SignalGuard.install` failed
+                // earlier, raise() would stop the process with the
+                // terminal still in raw mode + bracketed paste. In
+                // those cases route to a diagnostic and no-op.
+                if (!self.owns_raw_mode or !self.terminal.canSuspendSafely()) {
+                    self.diag(.{
+                        .kind = .render_failed,
+                        .detail = "suspend_self: zigline doesn't own raw mode or SIGTSTP handler not installed",
+                    });
+                    return null;
+                }
                 try self.renderer.finalize(&self.terminal);
                 self.renderer.markFresh();
                 _ = std.c.raise(.TSTP);
@@ -1038,12 +1142,6 @@ pub const Editor = struct {
             .custom => |id| return try self.handleCustomAction(id),
         }
         return null;
-    }
-
-    fn insertChar(self: *Editor, cp: u21) !void {
-        var buf: [4]u8 = undefined;
-        const len = std.unicode.utf8Encode(cp, &buf) catch return;
-        try self.buffer.insertText(buf[0..len]);
     }
 
     fn insertCharRecorded(self: *Editor, cp: u21) !void {
@@ -1062,8 +1160,10 @@ pub const Editor = struct {
         if (sanitized.len == 0) return;
         // Paste is a logical-action boundary — typing immediately
         // before or after the paste shouldn't merge into it as a
-        // single coalesced insert.
+        // single coalesced insert. yank_last_arg cycling state is
+        // also dropped (paste isn't part of the cycle).
         self.kill_ring.reset();
+        self.yank_last_arg = null;
         self.changeset.breakSequence();
         const cursor_before = self.buffer.cursor_byte;
         try self.buffer.insertText(sanitized);
@@ -1121,7 +1221,10 @@ pub const Editor = struct {
         const common = utf8TruncateToBoundary(lcp_full);
         const current = self.buffer.slice()[result.replacement_start..result.replacement_end];
 
-        if (common.len > current.len and std.unicode.utf8ValidateSlice(common)) {
+        if (common.len > current.len and
+            std.unicode.utf8ValidateSlice(common) and
+            buffer_mod.findUnsafeByte(common) == null)
+        {
             const old = try self.allocator.dupe(u8, current);
             defer self.allocator.free(old);
             const cursor_before = self.buffer.cursor_byte;
@@ -1214,8 +1317,14 @@ pub const Editor = struct {
             self.diag(.{ .kind = .completion_invalid_candidate, .detail = "insert is not valid UTF-8" });
             return;
         }
+        // Sanitize: completion candidates must not carry control
+        // bytes (ANSI injection / single-line invariant break).
+        if (buffer_mod.findUnsafeByte(cand.insert) != null) {
+            self.diag(.{ .kind = .completion_invalid_candidate, .detail = "insert contains control bytes" });
+            return;
+        }
         if (cand.append) |c| {
-            if (c >= 0x80 or c < 0x20) {
+            if (c >= 0x80 or c < 0x20 or c == 0x7f) {
                 self.diag(.{ .kind = .completion_invalid_candidate, .detail = "append byte is not ASCII printable" });
                 return;
             }
@@ -1276,6 +1385,17 @@ pub const Editor = struct {
             try self.terminal.writeAll(prompt.bytes);
         }
         self.buffer.clear();
+        // Mirror the raw-mode readLine state-reset block. Most of
+        // these are no-ops in cooked mode (no keymap dispatch, no
+        // multi-key state, no kill-ring action) but resetting
+        // unconditionally keeps the readLine entry contract uniform
+        // across both paths.
+        self.changeset.clear();
+        self.kill_ring.reset();
+        self.pending_keys.clearRetainingCapacity();
+        self.quoted_insert_pending = false;
+        self.yank_last_arg = null;
+        self.last_yank_start = 0;
         var byte: [1]u8 = undefined;
         while (true) {
             const n = std.c.read(self.options.input_fd, &byte, 1);
@@ -2062,6 +2182,59 @@ test "editor: yank_last_arg cycles through entries on repeat" {
     // Second M-. cycles back to the previous entry.
     _ = try editor.dispatch(.yank_last_arg, prompt_mod.Prompt.plain(""));
     try std.testing.expectEqualStrings("cat hello", editor.buffer.slice());
+}
+
+test "editor: Action.insert_text rejects control bytes via diagnostic" {
+    var diag: DiagTestCtx = .{};
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .diagnostic = diag.hook(),
+    });
+    defer editor.deinit();
+    try editor.buffer.insertText("safe");
+    // Inject ESC via Action.insert_text; should be rejected, buffer unchanged.
+    _ = try editor.dispatch(.{ .insert_text = "\x1b[2Jbad" }, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("safe", editor.buffer.slice());
+    try std.testing.expect(diag.count >= 1);
+}
+
+test "editor: Action.insert_text rejects invalid UTF-8 via diagnostic" {
+    var diag: DiagTestCtx = .{};
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .diagnostic = diag.hook(),
+    });
+    defer editor.deinit();
+    try editor.buffer.insertText("hi");
+    _ = try editor.dispatch(.{ .insert_text = "\xff\xfe" }, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("hi", editor.buffer.slice());
+    try std.testing.expect(diag.count >= 1);
+}
+
+test "editor: yank_last_arg state resets on default-insert" {
+    // Regression: pre-fix, the cycling-state reset only happened in
+    // dispatch(), but default-insert (printable char with no keymap
+    // binding) goes through handleKeyDirect bypassing dispatch. So
+    // M-. → typed letter → M-. would still cycle when it shouldn't.
+    var hist = try history_mod.History.init(std.testing.allocator, .{});
+    defer hist.deinit();
+    try hist.append("foo bar");
+    try hist.append("baz qux");
+
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled, .history = &hist });
+    defer editor.deinit();
+    _ = try editor.dispatch(.yank_last_arg, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("qux", editor.buffer.slice());
+
+    // Default-insert via handleKeyDirect should reset cycle state.
+    const a = input_mod.KeyEvent{ .code = .{ .char = 'a' } };
+    _ = try editor.handleKeyDirect(a, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqual(@as(?YankLastArgState, null), editor.yank_last_arg);
+
+    // Now M-. starts a fresh cycle from the most-recent entry's
+    // last token, appended at the new cursor position.
+    _ = try editor.dispatch(.yank_last_arg, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("quxaqux", editor.buffer.slice());
 }
 
 test "editor: yank_last_arg state resets on non-yank action" {

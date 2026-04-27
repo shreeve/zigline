@@ -19,14 +19,18 @@ const Cluster = @import("buffer.zig").Cluster;
 pub const Allocator = std.mem.Allocator;
 
 pub const WidthPolicy = struct {
-    /// East Asian "ambiguous" width characters. False == 1; true == 2.
-    /// Wired into the type so it appears in the public API; honoring
-    /// this dynamically is a v0.2 item (FUTURE.md). zg's
-    /// `DisplayWidth` is built with the default cjk=false at zigline's
-    /// `build.zig.zon` declaration; flipping it requires a build option.
+    /// East Asian "ambiguous" width characters: false → 1 cell,
+    /// true → 2 cells. **Currently ignored at runtime**: the `zg`
+    /// `DisplayWidth` dependency is built with `cjk=false` at the
+    /// `build.zig.zon` level, so flipping this field has no effect
+    /// until we expose a runtime branch (tracked in `FUTURE.md` as
+    /// "Configurable ambiguous-width policy"). The field is kept on
+    /// the public type so apps that already set it don't break when
+    /// we wire the runtime path through.
     ambiguous_is_wide: bool = false,
-    /// Display width of a TAB character. Tabs aren't allowed in the
-    /// buffer in v0.1; this exists for v0.2 paste handling.
+    /// Display width of a TAB character. Currently unused — the
+    /// buffer rejects tabs at every entry point. Exists for the
+    /// post-v1.0 "Tab rendering" item in `FUTURE.md`.
     tab_width: u8 = 8,
 };
 

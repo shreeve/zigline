@@ -75,14 +75,23 @@ pub const KillRing = struct {
     /// text merges into the current slot; otherwise advances the ring
     /// (cycling at capacity) and stores the new text in a fresh slot.
     pub fn kill(self: *KillRing, text: []const u8, mode: Mode) !void {
+        // Capacity 0 disables the ring. We still record the action
+        // so subsequent kills are coalesced semantically (even
+        // though there's no slot to write into).
         if (self.capacity == 0) {
             self.last_action = .kill;
             return;
         }
 
+        // The two paths share a state-update discipline: do the
+        // allocation FIRST, then mutate `self.slots` and only then
+        // set `self.last_action`. If allocation fails, `last_action`
+        // stays at its prior value so a subsequent retry still
+        // coalesces or starts fresh as appropriate.
         switch (self.last_action) {
             .kill => {
-                // Coalesce into the current slot.
+                // Coalesce into the current slot. Build the new
+                // buffer first so an OOM leaves the slot untouched.
                 const old = self.slots.items[self.index];
                 const new_buf = try self.allocator.alloc(u8, old.len + text.len);
                 switch (mode) {
@@ -97,29 +106,40 @@ pub const KillRing = struct {
                 }
                 self.allocator.free(old);
                 self.slots.items[self.index] = new_buf;
+                // last_action was already `.kill`; no change.
             },
             else => {
-                self.last_action = .kill;
                 if (self.slots.items.len == 0) {
-                    // First-ever kill: index stays 0, push.
+                    // First-ever kill: dupe + push, then set state.
                     const owned = try self.allocator.dupe(u8, text);
+                    errdefer self.allocator.free(owned);
                     try self.slots.append(self.allocator, owned);
                 } else if (self.index + 1 == self.capacity) {
-                    // Ring full and at end — wrap to slot 0.
-                    self.index = 0;
+                    // Ring full and at end — wrap to slot 0. Stage
+                    // the dupe BEFORE freeing the old so an OOM
+                    // doesn't lose the prior slot.
+                    const owned = try self.allocator.dupe(u8, text);
                     self.allocator.free(self.slots.items[0]);
-                    self.slots.items[0] = try self.allocator.dupe(u8, text);
+                    self.slots.items[0] = owned;
+                    self.index = 0;
                 } else {
-                    // Advance to next slot.
-                    self.index += 1;
-                    if (self.index < self.slots.items.len) {
-                        self.allocator.free(self.slots.items[self.index]);
-                        self.slots.items[self.index] = try self.allocator.dupe(u8, text);
+                    // Advance to next slot. Stage everything before
+                    // touching `self.index` so an OOM leaves the
+                    // ring's logical position unchanged.
+                    const new_idx = self.index + 1;
+                    if (new_idx < self.slots.items.len) {
+                        const owned = try self.allocator.dupe(u8, text);
+                        self.allocator.free(self.slots.items[new_idx]);
+                        self.slots.items[new_idx] = owned;
                     } else {
                         const owned = try self.allocator.dupe(u8, text);
+                        errdefer self.allocator.free(owned);
                         try self.slots.append(self.allocator, owned);
                     }
+                    self.index = new_idx;
                 }
+                // Slot update succeeded; record the action only now.
+                self.last_action = .kill;
             },
         }
     }

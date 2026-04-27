@@ -37,14 +37,18 @@ before v2.0.
 `eof`), `RawModePolicy`, `PastePolicy`.
 
 **Buffer.**
-`Buffer.init`, `Buffer.deinit`, `Buffer.slice`, `Buffer.cursor_byte`,
-`Buffer.isEmpty`, `Buffer.byteLen`, `Buffer.insertText`,
-`Buffer.deleteBackwardCluster`, `Buffer.deleteForwardCluster`, the
-cursor-motion methods. `Cluster` field shape.
+`Buffer.init`, `Buffer.deinit`, `Buffer.slice`, `Buffer.byteLen`,
+`Buffer.isEmpty`, `Buffer.insertText`, `Buffer.deleteBackwardCluster`,
+`Buffer.deleteForwardCluster`, the cursor-motion methods
+(`moveLeftCluster`, `moveRightCluster`, `moveLeftWord`,
+`moveRightWord`, `moveToStart`, `moveToEnd`), and the new in-place
+transforms (`transposeChars`, `editWord`, `squeezeWhitespace`).
+`Cluster` field shape. `EditResult` and `WordCase` types. The
+`findUnsafeByte` helper (used at hook boundaries to reject
+control-byte injection).
 
 **Prompt.**
-`Prompt.plain`, `Prompt.withWidth`, the `bytes` / `display_width` field
-shape.
+`Prompt.plain`, `Prompt.fromUtf8`, the `bytes` / `width` field shape.
 
 **Input.**
 `KeyEvent`, `KeyCode`, `Modifiers`, `Event` — variants locked.
@@ -109,15 +113,18 @@ Anything not re-exported from `src/root.zig` is internal. Examples:
 
 ## Concrete blockers between here and v1.0
 
-From `FUTURE.md`, in priority order:
+Updated for v0.2.x state. Two of the three original v1.0 blockers
+shipped:
 
-1. **Multi-column completion menu UI.** The current single-line
-   space-separated list is a placeholder for a real menu.
-2. **Custom key bindings.** `Keymap` is currently swap-only; v1.0 needs
-   a binding-table API so apps can override individual keys without
-   forking the keymap.
-3. **One real-world consumer integration through a release cycle.**
-   [slash](https://github.com/shreeve/slash) is shipping with zigline
-   today; the issues it surfaces are what we tighten before v1.0.
+1. ⏳ **Multi-column completion menu UI.** Designed in SPEC.md
+   §6.5 / §6.6 / §6.7; pending slash review of four open UX
+   questions before code lands.
+2. ✅ **Binding-table API on `Keymap`** — shipped in v0.2.0. Multi-
+   key sequences (`Ctrl-X Ctrl-E`, etc.) via the optional
+   `BindingTable` overlay; `lookupFn` shape preserved.
+3. ✅ **One real-world consumer release cycle** — slash 1.0.0
+   shipped with zigline embedded; v0.1.4 / v0.1.5 / v0.1.6 / v0.2.0
+   all integrated through the path-dep mechanism with no observed
+   regressions.
 
 Items in `FUTURE.md` not on this list are post-v1.0.

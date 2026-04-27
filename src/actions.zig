@@ -94,17 +94,6 @@ pub const Action = union(enum) {
     custom: u32,
 };
 
-pub const DispatchOutcome = union(enum) {
-    /// Action applied; continue the read loop.
-    continue_,
-    /// Line was accepted; readLine returns this slice.
-    accepted: []u8,
-    /// Line was cancelled (Ctrl-C); readLine returns interrupt.
-    cancelled,
-    /// EOF was signaled; readLine returns eof.
-    eof,
-};
-
 test "actions: tagged union compiles" {
     const a: Action = .move_left;
     _ = a;

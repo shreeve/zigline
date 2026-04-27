@@ -75,7 +75,6 @@ pub const Event = @import("input.zig").Event;
 // =============================================================================
 
 pub const Action = @import("actions.zig").Action;
-pub const DispatchOutcome = @import("actions.zig").DispatchOutcome;
 
 /// `KeyEvent → Action` mapping. The default is `Keymap.defaultEmacs()`.
 /// `Keymap.bindings` (optional) plugs in a `BindingTable` overlay

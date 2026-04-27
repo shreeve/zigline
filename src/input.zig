@@ -374,7 +374,10 @@ pub const Reader = struct {
         // CSI: read parameters (digits and ';') until a final byte
         // (0x40–0x7e). Bracketed paste markers `\x1b[200~`/`\x1b[201~`
         // are a special CSI; we recognize them after parsing.
-        var params: [16]u8 = undefined;
+        // 32 bytes covers the longest realistic CSI parameter run
+        // (modified key sequences, mouse reports). Anomalous longer
+        // sequences trigger the overflow recovery below.
+        var params: [32]u8 = undefined;
         var plen: usize = 0;
         var final: u8 = 0;
         while (true) {
@@ -394,10 +397,18 @@ pub const Reader = struct {
                 final = b;
                 break;
             }
-            if (plen < params.len) {
-                params[plen] = b;
-                plen += 1;
+            if (plen >= params.len) {
+                // Buffer full — anomalous CSI. Recover by pushing
+                // back what we have PLUS the byte that didn't fit
+                // PLUS the leading `[`. Pre-v0.2.x silently dropped
+                // bytes 17+; the new behavior preserves user input.
+                self.pushBack(b);
+                self.pushBackBytes(params[0..plen]);
+                self.pushBack('[');
+                return .{ .key = .{ .code = .escape } };
             }
+            params[plen] = b;
+            plen += 1;
         }
         const param_slice = params[0..plen];
 
@@ -407,8 +418,8 @@ pub const Reader = struct {
         }
 
         // Strip trailing modifier suffix (e.g. `1;5D` → arrow with
-        // modifiers). For v0.0 we ignore mod values; just look at the
-        // final byte.
+        // modifiers). `parseCsiMods` decodes the mod field; the final
+        // byte still drives the keycode dispatch below.
         const mods = parseCsiMods(param_slice);
 
         switch (final) {
@@ -468,12 +479,49 @@ pub const Reader = struct {
     }
 
     fn parsePastePayload(self: *Reader) ?Event {
-        // Read until we see the close marker `\x1b[201~`.
+        // Read until we see the close marker `\x1b[201~`. CSI/SS3
+        // have timeout recovery; paste needs the same shape so a
+        // truncated stream or malformed open marker can't wedge
+        // the read loop indefinitely.
         self.scratch.clearRetainingCapacity();
         const close = "\x1b[201~";
         var match_idx: usize = 0;
+        // 1 MiB cap. Real pastes are bounded by what the user can
+        // produce; 1 MiB is generous for any sane workflow and
+        // bounds memory growth from a misbehaving terminal.
+        const max_payload: usize = 1 << 20;
+        // 5-second per-byte timeout. Real pastes deliver bytes
+        // back-to-back; a 5s gap means the terminal forgot to send
+        // the close marker (or the stream was truncated). Don't
+        // wait forever.
+        const between_bytes_timeout_ms: i32 = 5000;
         while (true) {
-            const b = self.readByte() catch return .{ .error_ = error.ReadFailed };
+            // Cap with margin for the in-progress match prefix so we
+            // never push past `max_payload` even after flushing it.
+            if (self.scratch.items.len + match_idx >= max_payload) {
+                // Cap reached — flush any partial close-marker we
+                // were holding so its bytes aren't silently dropped.
+                if (match_idx > 0) {
+                    self.scratch.appendSlice(self.allocator, close[0..match_idx]) catch return .{ .error_ = error.OutOfMemory };
+                    match_idx = 0;
+                }
+                // Drain remaining paste bytes until the close marker
+                // (or timeout). Drained bytes are discarded — the
+                // caller accepted a truncated payload, but we must
+                // consume the rest so it doesn't leak into normal
+                // key parsing as injected keystrokes.
+                self.drainPasteToClose(close, between_bytes_timeout_ms);
+                return .{ .paste = self.scratch.items };
+            }
+            const b = self.readByteWithin(between_bytes_timeout_ms) orelse {
+                // Timeout — same flush-on-exit as the cap path. The
+                // user's bytes that matched a partial close marker
+                // are real input; emit them.
+                if (match_idx > 0) {
+                    self.scratch.appendSlice(self.allocator, close[0..match_idx]) catch return .{ .error_ = error.OutOfMemory };
+                }
+                return .{ .paste = self.scratch.items };
+            };
             if (b == close[match_idx]) {
                 match_idx += 1;
                 if (match_idx == close.len) {
@@ -493,6 +541,33 @@ pub const Reader = struct {
                 continue;
             }
             self.scratch.append(self.allocator, b) catch return .{ .error_ = error.OutOfMemory };
+        }
+    }
+
+    /// After the paste payload hits the cap, drain bytes until the
+    /// close marker (or timeout) so they don't bleed into normal key
+    /// parsing as injected keystrokes. Drained bytes are discarded;
+    /// the caller already accepted the truncated payload. Best-
+    /// effort: a stuck terminal can stop sending mid-paste; the
+    /// timeout bounds the wait.
+    fn drainPasteToClose(self: *Reader, close: []const u8, timeout_ms: i32) void {
+        var match_idx: usize = 0;
+        // Hard ceiling on drained bytes: 64 MiB post-cap is more
+        // than any realistic paste; further input is a misbehaving
+        // terminal we shouldn't keep blocking on.
+        var drained: usize = 0;
+        const drain_ceiling: usize = 64 * 1024 * 1024;
+        while (drained < drain_ceiling) {
+            const b = self.readByteWithin(timeout_ms) orelse return;
+            drained += 1;
+            if (b == close[match_idx]) {
+                match_idx += 1;
+                if (match_idx == close.len) return;
+            } else if (b == close[0]) {
+                match_idx = 1;
+            } else {
+                match_idx = 0;
+            }
         }
     }
 };

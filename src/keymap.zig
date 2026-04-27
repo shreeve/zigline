@@ -64,6 +64,15 @@ pub const BindError = error{
     /// Sequence contains a `KeyCode.text` or `KeyCode.unknown`,
     /// neither of which is bindable.
     UnbindableKey,
+    /// New sequence is a prefix of an existing binding, OR an
+    /// existing binding is a prefix of the new sequence. Without
+    /// chord-resolve timeout (which is post-v1.0; see FUTURE.md),
+    /// such combinations make one of the two bindings unreachable.
+    /// Per SPEC §5.2 a key K cannot simultaneously trigger a
+    /// single-key action AND start a multi-key sequence.
+    /// Resolution: pick one role for K; either remove the singleton
+    /// binding or remove all sequences that start with it.
+    PrefixConflict,
     /// Allocator failure.
     OutOfMemory,
 };
@@ -103,7 +112,10 @@ pub const BindingTable = struct {
 
     /// Bind `seq` to `action`. If `seq` was already bound, replaces
     /// the action and returns the previous one. If no prior binding,
-    /// returns null.
+    /// returns null. Returns `error.PrefixConflict` when the new
+    /// sequence and an existing binding would make either of the two
+    /// unreachable under the v1.0 dispatch model — see the doc on
+    /// `BindError.PrefixConflict`.
     pub fn bind(
         self: *BindingTable,
         seq: []const KeyEvent,
@@ -119,7 +131,8 @@ pub const BindingTable = struct {
         }
         const new_seq = encoded_buf[0..seq.len];
 
-        // Replace existing if any.
+        // Replace existing if any (exact match — same length + bytes).
+        // Replacing isn't a conflict; you can rebind a known sequence.
         for (self.entries.items) |*entry| {
             if (entry.seq.len == new_seq.len and
                 std.mem.eql(u32, entry.seq, new_seq))
@@ -127,6 +140,25 @@ pub const BindingTable = struct {
                 const prev = entry.action;
                 entry.action = action;
                 return prev;
+            }
+        }
+
+        // Reject prefix conflicts. Two cases:
+        //   a) An existing binding is a strict prefix of the new
+        //      sequence. The existing one would shadow this new one.
+        //   b) The new sequence is a strict prefix of an existing
+        //      binding. The new one would shadow the existing.
+        // Either way, one of the two is unreachable; refuse.
+        for (self.entries.items) |entry| {
+            if (entry.seq.len < new_seq.len and
+                std.mem.eql(u32, entry.seq, new_seq[0..entry.seq.len]))
+            {
+                return error.PrefixConflict;
+            }
+            if (entry.seq.len > new_seq.len and
+                std.mem.eql(u32, entry.seq[0..new_seq.len], new_seq))
+            {
+                return error.PrefixConflict;
             }
         }
 
@@ -461,27 +493,53 @@ test "bindings: empty / overlong / unbindable seq rejected" {
     try std.testing.expectError(error.UnbindableKey, t.bind(&text, .undo));
 }
 
-test "bindings: leaf wins over its own prefix-partial" {
-    // If a sequence S is bound AND another bound sequence starts
-    // with S, lookup(S) returns `bound`, not `partial`. Necessary
-    // for "Ctrl-X" being its own action while "Ctrl-X Ctrl-E" is
-    // ALSO bound — except we explicitly disallow that combination
-    // per SPEC §5.2 precedence rule. This test just confirms the
-    // single-sequence case.
+test "bindings: prefix conflict — existing prefix vs new long sequence — refused" {
+    // Per SPEC §5.2, a key K cannot simultaneously trigger a
+    // single-key action AND start a multi-key sequence. If the user
+    // tries to bind both, `bind()` rejects with `PrefixConflict`.
     var t = BindingTable.init(std.testing.allocator);
     defer t.deinit();
 
     const x = [_]KeyEvent{ctrlChar('x')};
     const xe = [_]KeyEvent{ ctrlChar('x'), ctrlChar('e') };
     _ = try t.bind(&x, .{ .custom = 1 });
-    _ = try t.bind(&xe, .{ .custom = 2 });
+    // Now try to bind Ctrl-X Ctrl-E — `x` would be unreachable.
+    try std.testing.expectError(error.PrefixConflict, t.bind(&xe, .{ .custom = 2 }));
+}
 
-    // Lookup of just Ctrl-X: a longer binding starts with it, AND
-    // an exact match exists. Exact match wins per the dispatch rules.
-    const r = t.lookup(&x);
-    try std.testing.expect(r == .bound);
-    switch (r) {
-        .bound => |a| try std.testing.expectEqual(@as(u32, 1), a.custom),
-        else => return error.TestUnexpectedResult,
-    }
+test "bindings: prefix conflict — existing long vs new prefix — refused" {
+    // Reverse direction: the long sequence is bound first, then the
+    // user tries to bind the prefix as a singleton. Same outcome.
+    var t = BindingTable.init(std.testing.allocator);
+    defer t.deinit();
+
+    const xe = [_]KeyEvent{ ctrlChar('x'), ctrlChar('e') };
+    const x = [_]KeyEvent{ctrlChar('x')};
+    _ = try t.bind(&xe, .{ .custom = 2 });
+    try std.testing.expectError(error.PrefixConflict, t.bind(&x, .{ .custom = 1 }));
+}
+
+test "bindings: rebind same sequence is not a prefix conflict" {
+    // Replacing an existing binding (exact-length match) is allowed
+    // and returns the prior action. Not a PrefixConflict.
+    var t = BindingTable.init(std.testing.allocator);
+    defer t.deinit();
+
+    const x = [_]KeyEvent{ctrlChar('x')};
+    _ = try t.bind(&x, .{ .custom = 1 });
+    const prev = try t.bind(&x, .{ .custom = 9 });
+    try std.testing.expect(prev != null);
+    try std.testing.expect(prev.?.custom == 1);
+}
+
+test "bindings: non-conflicting siblings ok" {
+    // `Ctrl-X Ctrl-E` and `Ctrl-X Ctrl-S` share a prefix but neither
+    // is a prefix of the other, so both can coexist.
+    var t = BindingTable.init(std.testing.allocator);
+    defer t.deinit();
+
+    _ = try t.bind(&[_]KeyEvent{ ctrlChar('x'), ctrlChar('e') }, .{ .custom = 1 });
+    _ = try t.bind(&[_]KeyEvent{ ctrlChar('x'), ctrlChar('s') }, .{ .custom = 2 });
+    // The shared prefix `Ctrl-X` returns partial.
+    try std.testing.expect(t.lookup(&[_]KeyEvent{ctrlChar('x')}) == .partial);
 }

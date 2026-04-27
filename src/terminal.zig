@@ -280,6 +280,27 @@ pub const Terminal = struct {
         return 0;
     }
 
+    /// True iff a signal-guard is installed at all (some subset of
+    /// SIGWINCH/TSTP/CONT may have failed to attach individually).
+    /// Most callers want `canSuspendSafely` instead, which checks
+    /// the SIGTSTP handler specifically.
+    pub fn hasSignalGuard(self: *const Terminal) bool {
+        return self.signal_guard != null;
+    }
+
+    /// True iff the SIGTSTP handler is installed and ready to
+    /// restore termios before the process stops. `SignalGuard.install`
+    /// can succeed-with-some-handlers-failing (e.g. `sigaction(TSTP)`
+    /// returned non-zero); this method checks the specific handler
+    /// that `Editor.dispatch(.suspend_self)` depends on. If false,
+    /// `raise(SIGTSTP)` would leave the terminal in raw mode +
+    /// bracketed paste — the editor routes to a diagnostic and
+    /// no-ops in that case.
+    pub fn canSuspendSafely(self: *const Terminal) bool {
+        if (self.signal_guard) |g| return g.have_tstp;
+        return false;
+    }
+
     pub fn enterRawMode(self: *Terminal) !void {
         if (self.saved_termios != null) return; // already in raw mode
 
