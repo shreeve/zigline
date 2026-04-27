@@ -613,6 +613,58 @@ test "renderer: normalizeSpans sorts and drops overlaps" {
     try std.testing.expectEqual(@as(usize, 9), out[1].end);
 }
 
+test "renderer: alternating non-overlapping spans (slash dq-string highlight pattern)" {
+    // Pattern: a double-quoted string with embedded $var that needs
+    // green / yellow / green coloring. The highlighter MUST return
+    // spans as a sequence of non-overlapping ranges; an outer span
+    // that contains an inner one would have the inner dropped as an
+    // overlap.
+    var rend = Renderer.init(std.testing.allocator, .{});
+    defer rend.deinit();
+
+    var b = buffer_mod.Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("hello $var world");
+    try b.ensureClusters();
+
+    const in = [_]highlight.HighlightSpan{
+        .{ .start = 0, .end = 6, .style = .{ .fg = .{ .basic = .green } } },
+        .{ .start = 6, .end = 10, .style = .{ .fg = .{ .basic = .yellow } } },
+        .{ .start = 10, .end = 16, .style = .{ .fg = .{ .basic = .green } } },
+    };
+    const out = try rend.normalizeSpans(&b, &in);
+    try std.testing.expectEqual(@as(usize, 3), out.len);
+    try std.testing.expectEqual(@as(usize, 0), out[0].start);
+    try std.testing.expectEqual(@as(usize, 6), out[0].end);
+    try std.testing.expectEqual(@as(usize, 6), out[1].start);
+    try std.testing.expectEqual(@as(usize, 10), out[1].end);
+    try std.testing.expectEqual(@as(usize, 10), out[2].start);
+    try std.testing.expectEqual(@as(usize, 16), out[2].end);
+}
+
+test "renderer: nested overlapping spans drop the inner one" {
+    // Anti-pattern: a green span [0..16] with an INNER yellow span
+    // [6..10]. The inner overlaps the outer; normalizeSpans drops
+    // the second to keep the first. Slash must not return spans in
+    // this shape.
+    var rend = Renderer.init(std.testing.allocator, .{});
+    defer rend.deinit();
+
+    var b = buffer_mod.Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("hello $var world");
+    try b.ensureClusters();
+
+    const in = [_]highlight.HighlightSpan{
+        .{ .start = 0, .end = 16, .style = .{ .fg = .{ .basic = .green } } },
+        .{ .start = 6, .end = 10, .style = .{ .fg = .{ .basic = .yellow } } },
+    };
+    const out = try rend.normalizeSpans(&b, &in);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqual(@as(usize, 0), out[0].start);
+    try std.testing.expectEqual(@as(usize, 16), out[0].end);
+}
+
 test "renderer: normalizeSpans snaps mid-cluster boundaries outward" {
     var rend = Renderer.init(std.testing.allocator, .{});
     defer rend.deinit();
