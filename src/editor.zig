@@ -397,7 +397,11 @@ pub const Editor = struct {
 
         var spans: []const highlight_mod.HighlightSpan = &.{};
         if (self.options.highlight) |hh| {
-            if (hh.highlight(self.allocator, self.buffer.slice())) |g| {
+            const req = highlight_mod.HighlightRequest{
+                .buffer = self.buffer.slice(),
+                .cursor_byte = self.buffer.cursor_byte,
+            };
+            if (hh.highlight(self.allocator, req)) |g| {
                 span_buf = g;
                 spans = g;
             } else |err| {
@@ -1637,6 +1641,48 @@ test "editor: withCookedMode propagates func errors" {
     try std.testing.expect(wcm.invoked);
 }
 
+
+// Cursor-aware highlight hook test: verify the editor passes the
+// current `cursor_byte` to the hook through `HighlightRequest`.
+const HighlightProbe = struct {
+    last_buffer_len: usize = 0,
+    last_cursor: usize = 0,
+    invoked: bool = false,
+};
+
+fn highlightProbeFn(
+    ctx: *anyopaque,
+    allocator: Allocator,
+    request: highlight_mod.HighlightRequest,
+) anyerror![]highlight_mod.HighlightSpan {
+    _ = allocator;
+    const probe: *HighlightProbe = @ptrCast(@alignCast(ctx));
+    probe.invoked = true;
+    probe.last_buffer_len = request.buffer.len;
+    probe.last_cursor = request.cursor_byte;
+    return &.{};
+}
+
+test "editor: HighlightRequest carries cursor_byte to the hook" {
+    // Tests the hook surface directly (not through render, which
+    // writes ANSI to the output fd and hangs in non-TTY test fds).
+    var probe: HighlightProbe = .{};
+    const hook = highlight_mod.HighlightHook{
+        .ctx = @ptrCast(&probe),
+        .highlightFn = highlightProbeFn,
+    };
+
+    const req = highlight_mod.HighlightRequest{
+        .buffer = "hello world",
+        .cursor_byte = 6,
+    };
+    const spans = try hook.highlight(std.testing.allocator, req);
+    defer std.testing.allocator.free(spans);
+
+    try std.testing.expect(probe.invoked);
+    try std.testing.expectEqual(@as(usize, 11), probe.last_buffer_len);
+    try std.testing.expectEqual(@as(usize, 6), probe.last_cursor);
+}
 
 test "editor: lastWhitespaceToken pulls trailing token" {
     try std.testing.expectEqualStrings("baz", lastWhitespaceToken("foo bar baz"));

@@ -1,5 +1,10 @@
-//! zigline example with a trivial highlighter that paints the first
-//! whitespace-delimited word in green and the rest in default color.
+//! zigline example: cursor-aware syntax highlighter.
+//!
+//! Two spans demonstrate both the buffer-only and the cursor-aware
+//! halves of the `HighlightRequest` API:
+//!
+//!   - First whitespace-delimited word: green + bold (buffer-only).
+//!   - Everything past the cursor: dim (uses `request.cursor_byte`).
 //!
 //! Build and run:
 //!   zig build run-with_highlight
@@ -10,24 +15,34 @@ const zigline = @import("zigline");
 fn highlight(
     ctx: *anyopaque,
     allocator: std.mem.Allocator,
-    buffer: []const u8,
+    request: zigline.HighlightRequest,
 ) anyerror![]zigline.HighlightSpan {
     _ = ctx;
+    const buffer = request.buffer;
 
     var spans: std.ArrayListUnmanaged(zigline.HighlightSpan) = .empty;
     errdefer spans.deinit(allocator);
 
+    // Span 1: first word in green + bold (buffer-only).
     var i: usize = 0;
     while (i < buffer.len and buffer[i] == ' ') : (i += 1) {}
     const word_start = i;
     while (i < buffer.len and buffer[i] != ' ') : (i += 1) {}
     const word_end = i;
-
     if (word_end > word_start) {
         try spans.append(allocator, .{
             .start = word_start,
             .end = word_end,
             .style = .{ .fg = .{ .basic = .green }, .bold = true },
+        });
+    }
+
+    // Span 2: everything past the cursor in dim (cursor-aware).
+    if (request.cursor_byte < buffer.len) {
+        try spans.append(allocator, .{
+            .start = request.cursor_byte,
+            .end = buffer.len,
+            .style = .{ .dim = true },
         });
     }
 

@@ -123,6 +123,11 @@ pub const CustomActionResult = @import("editor.zig").CustomActionResult;
 pub const CustomActionContext = @import("editor.zig").CustomActionContext;
 
 pub const HighlightHook = @import("highlight.zig").HighlightHook;
+/// Snapshot passed to a `HighlightHook`: `buffer` + `cursor_byte`.
+/// Mirrors `CompletionRequest` and `CustomActionRequest` for
+/// cross-hook consistency. Cursor-sensitive highlights (bracket
+/// matching, current-word emphasis) use `cursor_byte`.
+pub const HighlightRequest = @import("highlight.zig").HighlightRequest;
 /// Semantic span: a byte range + a style. The renderer sorts spans,
 /// drops overlaps, snaps endpoints to cluster boundaries, and emits
 /// SGR — applications should not encode escape bytes themselves.

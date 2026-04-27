@@ -61,9 +61,10 @@ the cursor-navigation methods, `HistoryOptions` field set.
 
 **Hooks.**
 `CompletionHook`, `CompletionRequest`, `CompletionResult`, `Candidate`,
-`CandidateKind`. `HighlightHook`, `HighlightSpan`, `Style`, `Color`.
-`CustomActionHook`, `CustomActionRequest`, `CustomActionResult`,
-`CustomActionContext`. `DiagnosticHook` and `Diagnostic` struct shape.
+`CandidateKind`. `HighlightHook`, `HighlightRequest`, `HighlightSpan`,
+`Style`, `Color`. `CustomActionHook`, `CustomActionRequest`,
+`CustomActionResult`, `CustomActionContext`. `DiagnosticHook` and
+`Diagnostic` struct shape.
 
 **Custom-action ID conventions.** `Action.custom: u32` IDs are opaque
 to zigline; applications assign their own labels. Recommended

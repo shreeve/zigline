@@ -975,15 +975,30 @@ pub const Candidate = struct {
 
 pub const CandidateKind = enum { plain, file, directory, command, variable };
 
+pub const HighlightRequest = struct {
+    /// Snapshot of the buffer at hook-call time. Borrowed; valid
+    /// only for the duration of `highlightFn`.
+    buffer: []const u8,
+    /// Cursor byte offset. Always at a grapheme cluster boundary.
+    /// Cursor-sensitive highlights — bracket matching, current-word
+    /// emphasis, unclosed-string warnings — read this field.
+    cursor_byte: usize,
+};
+
 pub const HighlightHook = struct {
     ctx: *anyopaque,
     highlightFn: *const fn (
         ctx: *anyopaque,
         allocator: Allocator,
-        buffer: []const u8,
+        request: HighlightRequest,
     ) anyerror![]HighlightSpan,
 };
 ```
+
+`HighlightRequest` mirrors `CompletionRequest` and
+`CustomActionRequest`. The struct shape is the long-term shape: new
+optional fields (terminal width, render column, in-flight action
+info) ship as v0.x non-breaking additions when needed.
 
 ### Error model
 

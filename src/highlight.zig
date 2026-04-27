@@ -49,24 +49,35 @@ pub const BasicColor = enum {
     white,
 };
 
+/// Snapshot passed to a `HighlightHook`. Borrowed; valid only for
+/// the duration of `highlightFn`. Mirrors `CompletionRequest` and
+/// `CustomActionRequest` for cross-hook consistency.
+pub const HighlightRequest = struct {
+    /// Buffer contents at hook-call time.
+    buffer: []const u8,
+    /// Cursor byte offset. Always at a grapheme cluster boundary.
+    /// Cursor-sensitive highlights — bracket matching, current-word
+    /// emphasis, unclosed-string warnings — read this field.
+    cursor_byte: usize,
+};
+
 pub const HighlightHook = struct {
     ctx: *anyopaque,
-    /// Called by the editor before each render. The `buffer` slice
-    /// is the current buffer bytes; the hook returns spans
-    /// allocated from the supplied `allocator`. The editor frees
-    /// the span slice after rendering.
+    /// Called by the editor before each render. The hook returns
+    /// spans allocated from the supplied `allocator`; the editor
+    /// frees the span slice after rendering.
     highlightFn: *const fn (
         ctx: *anyopaque,
         allocator: Allocator,
-        buffer: []const u8,
+        request: HighlightRequest,
     ) anyerror![]HighlightSpan,
 
     pub fn highlight(
         self: HighlightHook,
         allocator: Allocator,
-        buffer: []const u8,
+        request: HighlightRequest,
     ) anyerror![]HighlightSpan {
-        return self.highlightFn(self.ctx, allocator, buffer);
+        return self.highlightFn(self.ctx, allocator, request);
     }
 };
 
