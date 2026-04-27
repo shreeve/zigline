@@ -88,7 +88,7 @@ Red flags specific to 0.16 I want you to check for:
 - `= .{}` initializers on `ArrayListUnmanaged` / hashmaps (gone;
   use `.empty`).
 - `std.mem.trimLeft` / `trimRight` (renamed to trimStart/trimEnd).
-- `std.fs.*` (gone; use `std.Io.Dir`/`std.Io.File` with a threaded `io`).
+- `std.fs.File` / `std.fs.Dir` / `std.fs.cwd()` (the I/O surface; gone — use `std.Io.File` / `std.Io.Dir` / `std.Io.Dir.cwd()` with a threaded `io`). Note: `std.fs.path`, `std.fs.max_path_bytes`, and the base64 alphabet re-exports survive.
 - `std.process.argsAlloc` / `std.process.argsWithAllocator` (both
   gone; use `init.minimal.args.toSlice(arena)` or `init.args.iterate()`).
 - `std.heap.GeneralPurposeAllocator(.{}){}` (removed entirely; for
@@ -116,7 +116,8 @@ Red flags specific to 0.16 I want you to check for:
 - `std.posix.kill(pid, 0)` (kill's `sig` parameter is now the `SIG`
   enum type; on macOS the enum has no named `0` variant. For the
   POSIX null-signal existence check, use `std.c.kill(pid, @enumFromInt(0))`
-  which takes `c_int` at the ABI boundary.)
+  — `std.c.kill`'s signature is `fn kill(pid: pid_t, sig: SIG) c_int`,
+  so the `SIG` enum value with raw `0` is the right form.)
 - `/// doc-comment preceding a \`test "..."\` block` (rejected in 0.16
   with "documentation comments cannot be attached to tests" — use
   plain `//` comments instead).
@@ -730,7 +731,7 @@ If you're updating code from pre-0.15.1:
 1. ✅ **Remove all `usingnamespace`** - See migration patterns above
 2. ✅ **Update all I/O code** - Reader/Writer API completely changed
 3. ✅ **Update custom `format` methods** - New signature
-4. ✅ **Change `{}` to `{f}` or `{any}`** in format strings
+4. ✅ **Audit `{}` in format strings** — only types with a custom `format()` method need `{f}` (or `{any}` to skip it). Bare `{}` is fine for many primitives; strings still need `{s}`. Don't blindly mass-rewrite every `{}`.
 5. ✅ **Update inline assembly clobbers** (or run `zig fmt`)
 6. ✅ **Migrate away from `BoundedArray`**
 7. ✅ **Update compression code** if using zlib/gzip
@@ -840,7 +841,7 @@ Most LLMs' training data is **pre-0.15**. If you are an AI tool writing Zig code
 | `std.heap.ThreadSafeAllocator` | **Removed.** `std.heap.ArenaAllocator` is now threadsafe by default |
 | `std.os.environ` (global) | **Gone.** Use `init.environ_map` (Juicy) or `init.minimal.environ` (raw). `std.posix.getenv` also gone — fall back to `std.c.getenv(name_cstr)` if you need a bridge. |
 | `std.crypto.random.bytes(&buf)` / `std.posix.getrandom(&buf)` | `io.random(&buf)` (non-crypto) or `try io.randomSecure(&buf)` (crypto-grade) |
-| `std.process.Child.init(argv, gpa).spawn()` | `var child = try std.process.spawn(io, .{ .argv = argv, .stdin = .pipe, ... })`. For capturing output use `std.process.run(gpa, io, .{ ... })`. |
+| `std.process.Child.init(argv, gpa).spawn()` | `var child = try std.process.spawn(io, .{ .argv = argv, .stdin = .pipe, ... })`. For capturing output use `try std.process.run(gpa, io, .{ ... })`. |
 | `std.fs.selfExePathAlloc(gpa)` | `std.process.executablePathAlloc(io, gpa)` |
 | `std.posix.close(fd)` / `fstat` / `ftruncate` / `fsync` / `unlink` / `open` / `write` / `isatty` / `pipe` / `fork` / `waitpid` / `exit` | **All removed from `std.posix`.** Drop to `std.c.*` with `std.c.errno(rc)` switches, or use `std.Io.File` / `std.Io.Dir` for the high-level form. (`std.posix.read`, `mmap`, `munmap`, `msync`, `madvise`, `openatZ`, `kill` with `SIG` enum, `fdatasync`, `poll`, `tcgetattr`, `tcsetattr`, `sigaction` all survive.) |
 | `std.posix.PROT.READ \| std.posix.PROT.WRITE` | `.{ .READ = true, .WRITE = true }` — PROT is now a packed struct type (`macho.vm_prot_t` on macOS); `std.posix.mmap`'s `prot` parameter accepts the struct directly, not `u32` |
@@ -913,7 +914,7 @@ The `Io` parameter now flows through:
 - Networking (`std.Io.net`)
 - Process management (`std.process.spawn`, `std.process.run`, `std.process.replace`)
 - Sync primitives (mutex, condition, event, semaphore, rwlock, futex)
-- Time / clocks (`std.Io.Timestamp`)
+- Time / clocks (`std.Io.Clock.Timestamp` for monotonic + wall-clock readings; `std.Io.Timestamp` is the lower-level raw-nanosecond struct used internally)
 - Entropy (`io.random`, `io.randomSecure`)
 - HTTP client (`std.http.Client`)
 - Termination / cancelation (`error.Canceled`)
@@ -983,7 +984,7 @@ If you're upgrading from Zig 0.15.x, expect to touch almost every file that does
 - [ ] **`@cImport` is deprecated** — migrate to `b.addTranslateC(...)` in `build.zig`.
 - [ ] **`std.fs.*` → `std.Io.Dir` / `std.Io.File`**, with an `Io` parameter added to most calls.
 - [ ] **`std.net.*` → `std.Io.net.*`**.
-- [ ] **`std.time.Instant` / `Timer` / `timestamp()` → `std.Io.Timestamp`**.
+- [ ] **`std.time.Instant` / `Timer` / `timestamp()` → `std.Io.Clock.Timestamp.now(io, .awake)`** (use `.real` for wall-clock).
 - [ ] **`std.Thread.Mutex` / `Condition` / `ResetEvent` / `Semaphore` / `RwLock` / `Futex` → `std.Io.*` equivalents.**
 - [ ] **`std.process.getCwd` → `std.process.currentPath`**.
 - [ ] **`std.posix.mlock*`, `mmap` flag style → `std.process.lockMemory*` and struct-field flag style.**
@@ -1692,7 +1693,7 @@ Concrete data from a real migration (a 7,300-line parser generator, 0.15.2 → 0
 | Medium grammar (features) | ~instant | 0.67s | 0.014s | **48×** |
 | MUMPS grammar | ~instant | 23s | 0.28s | **82×** |
 | `slash` grammar | ~instant | 8s | 0.05s | **160×** |
-| `zag` grammar | ~instant | 27s | 0.20s | **1,421×** |
+| `zag` grammar | ~instant | 27s | 0.019s | **1,421×** |
 | Full test suite | ~5s | 187s | 1.73s | **108×** |
 
 **A `ReleaseSafe` build of the same code**: MUMPS generation drops from 23s (Debug+init.gpa) to **0.033s** (ReleaseSafe+smp_allocator) — a 700× swing purely from the allocator change. So the slowdown is not "generally Zig 0.16" — it's specifically `DebugAllocator` in Debug.
@@ -1858,7 +1859,7 @@ const contents = try std.Io.Dir.cwd().readFileAlloc(io, file_name, allocator, .l
 `fs.File.readToEndAlloc`:
 
 ```zig
-var file_reader = file.reader(&.{});
+var file_reader = file.reader(io, &.{});
 const contents = try file_reader.interface.allocRemaining(allocator, .limited(1234));
 ```
 
@@ -1919,7 +1920,7 @@ var child = try std.process.spawn(io, .{
 });
 
 // run & capture output
-const result = std.process.run(allocator, io, .{ ... });
+const result = try std.process.run(allocator, io, .{ ... });
 
 // replace (execv)
 const err = std.process.replace(io, .{ .argv = argv });
@@ -1949,7 +1950,8 @@ std.process.getCwd / getCwdAlloc → std.process.currentPath / currentPathAlloc
 ```
 std.Thread.ResetEvent → std.Io.Event
 std.Thread.WaitGroup  → std.Io.Group
-std.Thread.Futex      → std.Io.Futex
+std.Thread.Futex      → free fns: std.Io.futexWait / futexWaitTimeout / futexWake
+                        (no `std.Io.Futex` type — see "Common Bad Assumptions" #19)
 std.Thread.Mutex      → std.Io.Mutex
 std.Thread.Condition  → std.Io.Condition
 std.Thread.Semaphore  → std.Io.Semaphore
@@ -1964,9 +1966,9 @@ Lock-free primitives (atomics, etc.) do **not** need the `Io` interface.
 #### Time
 
 ```
-std.time.Instant   → std.Io.Timestamp
-std.time.Timer     → std.Io.Timestamp
-std.time.timestamp → std.Io.Timestamp.now
+std.time.Instant   → std.Io.Clock.Timestamp
+std.time.Timer     → std.Io.Clock.Timestamp (use .durationTo for stopwatch timing)
+std.time.timestamp → std.Io.Clock.Timestamp.now(io, .real)
 ```
 
 `Clock.resolution` is now separately queryable, allowing `error.ClockUnsupported` / `error.Unexpected` to be removed from timer error sets (systems with "infinite" resolution are handled gracefully).
@@ -2361,7 +2363,7 @@ A concentrated "what do I grep for?" table:
 | `std.fs.File.pwrite` | `std.Io.File.writePositional` |
 | `std.fs.File.writeAll` | `std.Io.File.writeStreamingAll` |
 | `std.process.getCwd` | `std.process.currentPath(io, ...)` |
-| `std.process.Child.run(...)` | `std.process.run(allocator, io, .{ ... })` |
+| `std.process.Child.run(...)` | `try std.process.run(allocator, io, .{ ... })` |
 | `std.process.execv(arena, argv)` | `std.process.replace(io, .{ .argv = argv })` |
 Note: in 0.16, **`std.time` is just unit constants** (`ns_per_ms`, `ns_per_s`, `us_per_ms`, `ms_per_s`, etc.) plus the `epoch` submodule. `Instant`, `Timer`, `timestamp()`, `milliTimestamp()`, `nanoTimestamp()` — all gone. And `std.Thread` no longer exports sync primitives: `Mutex`, `Condition`, `ResetEvent`, `Semaphore`, `RwLock`, `WaitGroup`, `Pool`, **`Futex`** — all removed from `std.Thread`. The replacements live under `std.Io` (and `std.Io.futex*` for futex ops — see the Futex rows below; there is no `std.Io.Futex` type).
 
@@ -2774,8 +2776,8 @@ In Zig, format strings use `{}` placeholders with optional format specifiers. Th
 | `{b}` | Integer | Binary (base 2) | `5` → "101" |
 | `{e}` | Float | Lowercase scientific notation | `1000.0` → "1.0e+03" |
 | `{E}` | Float | Uppercase scientific notation | `1000.0` → "1.0E+03" |
-| `{}` | Any | Default formatting (see note) | Various |
-| `{any}` | Any | Debug formatting | Any type |
+| `{}` | Type-dependent default | Some types format implicitly (e.g. integers, floats); strings/slices/arrays require an explicit specifier (typically `{s}`); types with a custom `format()` method **must** use `{f}` or `{any}` (`{}` is rejected as ambiguous since 0.15) | Various |
+| `{any}` | Any | Debug formatting (skips any custom `format()`) | Any type |
 | `{f}` | Custom | Call custom `format()` method | Types with format() |
 | `{*}` | Pointer | Pointer address | `0x7fff1234` |
 | `{u}` | Unicode | Unicode code point | `'⚡'` → "⚡" |
@@ -2922,12 +2924,15 @@ std.debug.print("Emoji: {u}\n", .{'🎉'});
 You can reference arguments by position:
 
 ```zig
-std.debug.print("{0} {1} {0}\n", .{"echo", "chamber"});
+std.debug.print("{0s} {1s} {0s}\n", .{ "echo", "chamber" });
 // Output: echo chamber echo
 
-std.debug.print("{1} comes before {0}\n", .{"second", "first"});
+std.debug.print("{1s} comes before {0s}\n", .{ "second", "first" });
 // Output: first comes before second
 ```
+
+(Positional indices combine with the type specifier — e.g. `{0s}` for the
+0th argument as a string. Bare `{0}` would not compile for `[]const u8`.)
 
 ### Width, Alignment, and Fill
 
@@ -3026,32 +3031,40 @@ std.debug.print("Debug: {any}\n", .{obj});
 
 #### Alternative Pattern: Using `std.fmt.Alt`
 
-For stateful formatting:
+For stateful formatting (or to expose multiple format styles per type),
+add the helper as a method on the parent struct so the `{f}` call site
+can use `value.formatHex()` directly:
 
 ```zig
-pub fn formatHex(value: MyType) std.fmt.Alt(F, F.format) {
-    return .{ .data = .{ .value = value.value, .hex = true } };
-}
-
-const F = struct {
+const MyType = struct {
     value: i32,
-    hex: bool,
 
-    pub fn format(
-        self: F,
-        writer: *std.Io.Writer,
-    ) std.Io.Writer.Error!void {
-        if (self.hex) {
-            try writer.print("0x{x}", .{self.value});
-        } else {
-            try writer.print("{d}", .{self.value});
+    const F = struct {
+        value: i32,
+        hex: bool,
+
+        pub fn format(self: F, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            if (self.hex) {
+                try writer.print("0x{x}", .{self.value});
+            } else {
+                try writer.print("{d}", .{self.value});
+            }
         }
+    };
+
+    pub fn formatHex(self: MyType) std.fmt.Alt(F, F.format) {
+        return .{ .data = .{ .value = self.value, .hex = true } };
     }
 };
 
 // Usage:
+const value = MyType{ .value = 255 };
 std.debug.print("{f}\n", .{value.formatHex()});
+// Output: 0xff
 ```
+
+(If `formatHex` is a free function rather than a method, the call site
+becomes `formatHex(value)` instead of `value.formatHex()`.)
 
 ### Common Patterns
 
