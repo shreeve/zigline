@@ -287,6 +287,12 @@ pub const Editor = struct {
     /// previous history entry's last token. Reset by any non-yank-
     /// last-arg action.
     yank_last_arg: ?YankLastArgState = null,
+    /// Buffered key events for an in-flight multi-key sequence (only
+    /// used when `Keymap.bindings` is non-null). Cleared whenever a
+    /// sequence resolves (`.bound`), is replayed on mismatch (`.none`
+    /// with len > 1), falls through as singleton (`.none` with len
+    /// 1), or `readLine` enters / exits. See SPEC §5.2.
+    pending_keys: std.ArrayListUnmanaged(input_mod.KeyEvent) = .empty,
 
     pub fn init(allocator: Allocator, options: Options) !Editor {
         return .{
@@ -311,6 +317,7 @@ pub const Editor = struct {
         self.reader.deinit();
         self.kill_ring.deinit();
         self.changeset.deinit();
+        self.pending_keys.deinit(self.allocator);
     }
 
     /// Block until the user accepts, cancels, or sends EOF.
@@ -345,12 +352,19 @@ pub const Editor = struct {
         // Undo history is per-line: starting a new line drops any
         // leftover edits from the previous one.
         self.changeset.clear();
+        // Multi-key sequences shouldn't survive a `readLine` boundary.
+        self.pending_keys.clearRetainingCapacity();
         try self.render(prompt);
 
         while (true) {
             const ev = self.reader.next();
             switch (ev) {
                 .eof => {
+                    // Per SPEC §5.2, a non-key event resolves any
+                    // partial multi-key sequence as singletons before
+                    // it's processed. EOF still ends the loop, but a
+                    // pending prefix gets a chance to dispatch first.
+                    if (try self.flushPendingSequence(prompt)) |result| return result;
                     try self.renderer.finalize(&self.terminal);
                     if (self.options.history) |h| h.resetCursor();
                     return .eof;
@@ -359,8 +373,12 @@ pub const Editor = struct {
                     try self.renderer.finalize(&self.terminal);
                     return e;
                 },
-                .resize => try self.render(prompt),
+                .resize => {
+                    if (try self.flushPendingSequence(prompt)) |result| return result;
+                    try self.render(prompt);
+                },
                 .paste => |payload| {
+                    if (try self.flushPendingSequence(prompt)) |result| return result;
                     try self.handlePaste(payload);
                     try self.render(prompt);
                 },
@@ -727,44 +745,67 @@ pub const Editor = struct {
         self: *Editor,
         kev: input_mod.KeyEvent,
         prompt: prompt_mod.Prompt,
-    ) !?ReadLineResult {
+    ) anyerror!?ReadLineResult {
+        // Explicit `anyerror` because `replayPendingPrefix` recurses
+        // back through this function; an inferred error set would
+        // create a self-referential cycle.
+
         // `quoted_insert` (Ctrl-V / Ctrl-Q) was just dispatched —
-        // insert THIS event's bytes literally, bypassing the keymap
-        // and the default-insert filter. One-shot.
+        // insert THIS event's bytes literally, bypassing the keymap,
+        // the binding-table, and the default-insert filter. One-shot.
         if (self.quoted_insert_pending) {
-            self.quoted_insert_pending = false;
-            self.kill_ring.reset();
-            self.changeset.breakSequence();
-            switch (kev.code) {
-                .char => |cp| {
-                    // For `Ctrl-X`-style events (kev.mods.ctrl set),
-                    // emit the C0 control byte (`\x01` for Ctrl-A,
-                    // etc.) rather than the printable letter. This
-                    // is what readline / bash do; lets users insert
-                    // literal control bytes by typing Ctrl-V Ctrl-A.
-                    var emit: u21 = cp;
-                    if (kev.mods.ctrl) {
-                        if (cp >= '@' and cp <= '_') emit = cp - '@';
-                        if (cp >= 'a' and cp <= 'z') emit = cp - 'a' + 1;
-                    }
-                    try self.insertCharRecorded(emit);
-                },
-                .text => |t| {
-                    const cursor_before = self.buffer.cursor_byte;
-                    try self.buffer.insertText(t);
-                    self.recordInsertOrDiag(cursor_before, t, cursor_before, self.buffer.cursor_byte);
-                },
-                else => {}, // arrows, function keys: discard (matches readline)
-            }
-            self.changeset.breakSequence();
-            return null;
+            // Drop any in-flight multi-key prefix; literal-insert
+            // can't be part of a chord.
+            self.pending_keys.clearRetainingCapacity();
+            return try self.handleQuotedInsert(kev);
         }
 
-        // Default-insert: printable char with no keymap binding.
+        // Multi-key binding-table state machine (SPEC §5.2). Skip
+        // entirely when no overlay is set, preserving the v0.1.x
+        // single-key dispatch path verbatim.
+        if (self.options.keymap.bindings) |table| {
+            try self.pending_keys.append(self.allocator, kev);
+            switch (table.lookup(self.pending_keys.items)) {
+                .bound => |action| {
+                    self.pending_keys.clearRetainingCapacity();
+                    return self.dispatch(action, prompt);
+                },
+                .partial => return null, // wait for next event
+                .none => {
+                    if (self.pending_keys.items.len == 1) {
+                        // Single event with no multi-key match —
+                        // drop the buffer and dispatch via the
+                        // legacy single-key path with `kev`.
+                        self.pending_keys.clearRetainingCapacity();
+                        return self.handleKeyDirect(kev, prompt);
+                    }
+                    return self.replayPendingPrefix(prompt);
+                },
+            }
+        }
+
+        return self.handleKeyDirect(kev, prompt);
+    }
+
+    /// Single-key dispatch path that doesn't consult `bindings`. Used
+    /// directly when no overlay is set, and by `replayPendingPrefix`
+    /// for the first event of a failed multi-key prefix (per SPEC
+    /// §5.2).
+    fn handleKeyDirect(
+        self: *Editor,
+        kev: input_mod.KeyEvent,
+        prompt: prompt_mod.Prompt,
+    ) !?ReadLineResult {
         const action = self.options.keymap.lookup(kev) orelse {
             switch (kev.code) {
                 .char => |cp| {
                     if (cp < 0x20) return null;
+                    // Modified events that don't resolve to an
+                    // action are dropped, not inserted — Ctrl-X
+                    // with no binding shouldn't insert literal 'x'.
+                    // Shift is fine (kernel folds it into the char
+                    // for ASCII letters).
+                    if (kev.mods.ctrl or kev.mods.alt) return null;
                     // Typing breaks the kill-ring coalescing chain
                     // exactly like any non-kill action through
                     // dispatch — without this, two `Ctrl-U` kills
@@ -785,6 +826,65 @@ pub const Editor = struct {
         };
 
         return self.dispatch(action, prompt);
+    }
+
+    /// Replay the buffered prefix after a `.none` lookup with len > 1.
+    /// Per SPEC §5.2: dispatch the first event via the legacy single-
+    /// key path, then re-process the remaining events through the
+    /// full state machine (they may start a new chord).
+    fn replayPendingPrefix(self: *Editor, prompt: prompt_mod.Prompt) !?ReadLineResult {
+        std.debug.assert(self.pending_keys.items.len > 1);
+        const buffered = try self.allocator.dupe(input_mod.KeyEvent, self.pending_keys.items);
+        defer self.allocator.free(buffered);
+        self.pending_keys.clearRetainingCapacity();
+
+        if (try self.handleKeyDirect(buffered[0], prompt)) |r| return r;
+        for (buffered[1..]) |replay_kev| {
+            if (try self.handleKey(replay_kev, prompt)) |r| return r;
+        }
+        return null;
+    }
+
+    /// Flush any in-flight multi-key prefix as singletons, used when
+    /// a non-key event (paste / resize / EOF) arrives mid-chord.
+    /// Returns a `ReadLineResult` if any of the singleton dispatches
+    /// terminated the read.
+    fn flushPendingSequence(self: *Editor, prompt: prompt_mod.Prompt) !?ReadLineResult {
+        if (self.pending_keys.items.len == 0) return null;
+        if (self.pending_keys.items.len == 1) {
+            const kev = self.pending_keys.items[0];
+            self.pending_keys.clearRetainingCapacity();
+            return self.handleKeyDirect(kev, prompt);
+        }
+        return self.replayPendingPrefix(prompt);
+    }
+
+    /// Handle a key dispatched while `quoted_insert_pending` is set.
+    /// Inserts the event's bytes literally; control-letter chords
+    /// emit the corresponding C0 byte (Ctrl-A → \x01) to match
+    /// readline's quoted-insert.
+    fn handleQuotedInsert(self: *Editor, kev: input_mod.KeyEvent) !?ReadLineResult {
+        self.quoted_insert_pending = false;
+        self.kill_ring.reset();
+        self.changeset.breakSequence();
+        switch (kev.code) {
+            .char => |cp| {
+                var emit: u21 = cp;
+                if (kev.mods.ctrl) {
+                    if (cp >= '@' and cp <= '_') emit = cp - '@';
+                    if (cp >= 'a' and cp <= 'z') emit = cp - 'a' + 1;
+                }
+                try self.insertCharRecorded(emit);
+            },
+            .text => |t| {
+                const cursor_before = self.buffer.cursor_byte;
+                try self.buffer.insertText(t);
+                self.recordInsertOrDiag(cursor_before, t, cursor_before, self.buffer.cursor_byte);
+            },
+            else => {}, // arrows, function keys: discard (matches readline)
+        }
+        self.changeset.breakSequence();
+        return null;
     }
 
     fn dispatch(
@@ -1682,6 +1782,173 @@ test "editor: HighlightRequest carries cursor_byte to the hook" {
     try std.testing.expect(probe.invoked);
     try std.testing.expectEqual(@as(usize, 11), probe.last_buffer_len);
     try std.testing.expectEqual(@as(usize, 6), probe.last_cursor);
+}
+
+// =============================================================================
+// Binding-table dispatch tests (SPEC §5.2 state machine)
+// =============================================================================
+
+fn ctrlChar(c: u21) input_mod.KeyEvent {
+    return .{ .code = .{ .char = c }, .mods = .{ .ctrl = true } };
+}
+
+/// Test-only stand-in for the legacy lookupFn that recognizes
+/// only Ctrl-A → move_to_start. Anything else returns null so
+/// non-bound keys fall through to default-insert behavior.
+fn testCtrlALookup(key: input_mod.KeyEvent) ?actions_mod.Action {
+    if (key.mods.ctrl and key.code == .char and key.code.char == 'a') {
+        return .move_to_start;
+    }
+    return null;
+}
+
+test "editor: bindings .bound dispatches the bound action and clears pending" {
+    var bindings = keymap_mod.BindingTable.init(std.testing.allocator);
+    defer bindings.deinit();
+    _ = try bindings.bind(&[_]input_mod.KeyEvent{ ctrlChar('x'), ctrlChar('e') }, .move_to_start);
+
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .keymap = .{ .lookupFn = testCtrlALookup, .bindings = &bindings },
+    });
+    defer editor.deinit();
+    try editor.buffer.insertText("hello");
+    editor.buffer.cursor_byte = 5;
+
+    // First event: Ctrl-X → partial.
+    _ = try editor.handleKey(ctrlChar('x'), prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqual(@as(usize, 1), editor.pending_keys.items.len);
+    try std.testing.expectEqual(@as(usize, 5), editor.buffer.cursor_byte);
+
+    // Second event: Ctrl-E → bound, dispatches move_to_start.
+    _ = try editor.handleKey(ctrlChar('e'), prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqual(@as(usize, 0), editor.pending_keys.items.len);
+    try std.testing.expectEqual(@as(usize, 0), editor.buffer.cursor_byte);
+}
+
+test "editor: bindings .partial buffers without dispatching" {
+    var bindings = keymap_mod.BindingTable.init(std.testing.allocator);
+    defer bindings.deinit();
+    _ = try bindings.bind(&[_]input_mod.KeyEvent{ ctrlChar('x'), ctrlChar('e') }, .move_to_start);
+
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .keymap = .{ .lookupFn = testCtrlALookup, .bindings = &bindings },
+    });
+    defer editor.deinit();
+    try editor.buffer.insertText("hi");
+    editor.buffer.cursor_byte = 2;
+
+    _ = try editor.handleKey(ctrlChar('x'), prompt_mod.Prompt.plain(""));
+    // Ctrl-X is a partial; no action should have fired.
+    try std.testing.expectEqual(@as(usize, 1), editor.pending_keys.items.len);
+    try std.testing.expectEqual(@as(usize, 2), editor.buffer.cursor_byte);
+    try std.testing.expectEqualStrings("hi", editor.buffer.slice());
+}
+
+test "editor: bindings .none with len 1 falls through to lookupFn" {
+    var bindings = keymap_mod.BindingTable.init(std.testing.allocator);
+    defer bindings.deinit();
+    // Bindings exist but only for Ctrl-X-prefix sequences. A bare
+    // Ctrl-A doesn't match any prefix → fall through to lookupFn.
+    _ = try bindings.bind(&[_]input_mod.KeyEvent{ ctrlChar('x'), ctrlChar('e') }, .undo);
+
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .keymap = .{ .lookupFn = testCtrlALookup, .bindings = &bindings },
+    });
+    defer editor.deinit();
+    try editor.buffer.insertText("hello");
+    editor.buffer.cursor_byte = 5;
+
+    _ = try editor.handleKey(ctrlChar('a'), prompt_mod.Prompt.plain(""));
+    // lookupFn returns move_to_start for Ctrl-A → cursor jumps to 0.
+    try std.testing.expectEqual(@as(usize, 0), editor.buffer.cursor_byte);
+    try std.testing.expectEqual(@as(usize, 0), editor.pending_keys.items.len);
+}
+
+test "editor: bindings replay-on-mismatch dispatches first via lookupFn, processes rest" {
+    var bindings = keymap_mod.BindingTable.init(std.testing.allocator);
+    defer bindings.deinit();
+    // Only Ctrl-X Ctrl-E is bound. The user types Ctrl-X (partial)
+    // then 'q' (which doesn't extend the prefix). Ctrl-X has no
+    // single-key lookupFn binding (testCtrlALookup ignores it), so
+    // it's a no-op singleton; 'q' then default-inserts as text.
+    _ = try bindings.bind(&[_]input_mod.KeyEvent{ ctrlChar('x'), ctrlChar('e') }, .undo);
+
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .keymap = .{ .lookupFn = testCtrlALookup, .bindings = &bindings },
+    });
+    defer editor.deinit();
+
+    _ = try editor.handleKey(ctrlChar('x'), prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqual(@as(usize, 1), editor.pending_keys.items.len);
+
+    const q_event = input_mod.KeyEvent{ .code = .{ .char = 'q' } };
+    _ = try editor.handleKey(q_event, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqual(@as(usize, 0), editor.pending_keys.items.len);
+    try std.testing.expectEqualStrings("q", editor.buffer.slice());
+}
+
+test "editor: bindings precedence — sequence prefix beats single-key lookupFn" {
+    // SPEC §5.2: bindings consulted first. A prefix-K with bound
+    // sequence K-+-X cannot also fire a single-key K via lookupFn —
+    // the K-alone press becomes `partial`, awaiting the next event.
+    var bindings = keymap_mod.BindingTable.init(std.testing.allocator);
+    defer bindings.deinit();
+    _ = try bindings.bind(&[_]input_mod.KeyEvent{ ctrlChar('a'), ctrlChar('e') }, .move_to_end);
+
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .keymap = .{ .lookupFn = testCtrlALookup, .bindings = &bindings },
+    });
+    defer editor.deinit();
+    try editor.buffer.insertText("hello");
+    editor.buffer.cursor_byte = 5;
+
+    // Ctrl-A is normally `move_to_start` via lookupFn, but it's also
+    // a prefix of the bound sequence. The single-key action does
+    // NOT fire; the editor waits for the next event.
+    _ = try editor.handleKey(ctrlChar('a'), prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqual(@as(usize, 1), editor.pending_keys.items.len);
+    try std.testing.expectEqual(@as(usize, 5), editor.buffer.cursor_byte);
+}
+
+test "editor: bindings flushPendingSequence resolves prefix on non-key event" {
+    // Setup: Ctrl-X partial pending, then a non-key event arrives.
+    // The buffered prefix should resolve as a singleton via
+    // lookupFn (no-op here), then the non-key handling proceeds.
+    var bindings = keymap_mod.BindingTable.init(std.testing.allocator);
+    defer bindings.deinit();
+    _ = try bindings.bind(&[_]input_mod.KeyEvent{ ctrlChar('x'), ctrlChar('e') }, .undo);
+
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .keymap = .{ .lookupFn = testCtrlALookup, .bindings = &bindings },
+    });
+    defer editor.deinit();
+
+    _ = try editor.handleKey(ctrlChar('x'), prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqual(@as(usize, 1), editor.pending_keys.items.len);
+
+    _ = try editor.flushPendingSequence(prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqual(@as(usize, 0), editor.pending_keys.items.len);
+}
+
+test "editor: bindings null overlay preserves single-key path verbatim" {
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .keymap = .{ .lookupFn = testCtrlALookup, .bindings = null },
+    });
+    defer editor.deinit();
+    try editor.buffer.insertText("hello");
+    editor.buffer.cursor_byte = 5;
+
+    _ = try editor.handleKey(ctrlChar('a'), prompt_mod.Prompt.plain(""));
+    // Ctrl-A → move_to_start via lookupFn; pending_keys never used.
+    try std.testing.expectEqual(@as(usize, 0), editor.buffer.cursor_byte);
+    try std.testing.expectEqual(@as(usize, 0), editor.pending_keys.items.len);
 }
 
 test "editor: lastWhitespaceToken pulls trailing token" {

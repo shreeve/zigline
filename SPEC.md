@@ -1187,25 +1187,22 @@ scaffolded API + lifted code, not a polish target.
 
 The two named blockers between zigline-as-it-ships-today and a
 real v1.0 commitment. Both are concrete features with reference
-implementations in `misc/`; both are bounded scope (see §5.1's
-"not in scope" list for binding-table, and the columnar layout
-constraint for the menu).
+implementations in `misc/`; both are bounded scope.
 
-- **Binding-table API on `Keymap`** (§5.1, §5.2). Multi-key
-  sequences (`Ctrl-X Ctrl-E`, `Ctrl-X Ctrl-X`, etc.). Adds the
-  `BindingTable` type as an opt-in overlay; `Keymap.lookupFn` shape
-  preserved. Reference: `rustyline/src/binding.rs::encode`.
-  Unblocks: mark-and-point, `Ctrl-X Ctrl-E` for edit-in-EDITOR,
-  any future X-prefix vocabulary.
-- **Multi-column completion menu UI**. Replaces the v0.x single-
+- ✅ **Binding-table API on `Keymap`** (§5.1, §5.2) — shipped in
+  v0.2.0. Multi-key sequences (`Ctrl-X Ctrl-E`, `Ctrl-X Ctrl-X`,
+  etc.) via the optional `BindingTable` overlay; `Keymap.lookupFn`
+  shape preserved.
+- ✅ **One real-world consumer release cycle** — slash 1.0.0
+  shipped with zigline v0.1.5 embedded; v0.1.6 + v0.2.0 land into
+  slash via the same path-dep mechanism with no observed
+  regressions.
+- ⏳ **Multi-column completion menu UI**. Replaces the v0.x single-
   line space-separated placeholder with a columnar layout sized
   to terminal width, paged for overflow, keyboard-navigable.
   Reference: `reedline/src/menu/columnar_menu.rs::create_string`.
   We lift the layout math; we don't lift the trait abstraction
   (zigline ships one menu type, not three).
-- **One real-world consumer release cycle.** Slash shipping a
-  release with zigline embedded and observing what surfaces in
-  the field. Calendar work, not zigline keyboard work.
 
 ### v0.x continuing additions (non-breaking)
 

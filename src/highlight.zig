@@ -59,6 +59,14 @@ pub const HighlightRequest = struct {
     /// Cursor-sensitive highlights — bracket matching, current-word
     /// emphasis, unclosed-string warnings — read this field.
     cursor_byte: usize,
+
+    /// Convenience constructor for cursor-insensitive call sites
+    /// (most tests, hooks that ignore cursor position): sets
+    /// `cursor_byte` to end-of-buffer so any cursor-aware logic in
+    /// the hook acts as if the user is at the end.
+    pub fn forBuffer(buffer: []const u8) HighlightRequest {
+        return .{ .buffer = buffer, .cursor_byte = buffer.len };
+    }
 };
 
 pub const HighlightHook = struct {

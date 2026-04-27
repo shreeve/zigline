@@ -618,3 +618,23 @@ test "pty: completion fills longest common prefix" {
     try std.testing.expectEqual(@as(u8, 0), r.status);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "got: wonderful") != null);
 }
+
+test "pty: multi-key chord (Ctrl-X Ctrl-U) dispatches the bound action" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // with_custom_action binds Ctrl-X Ctrl-U to the "uppercase the
+    // buffer" action via the BindingTable overlay. Verifies the
+    // chord round-trip end-to-end: two keystrokes resolve to one
+    // action, no spurious literal 'x' or 'u' in the buffer.
+    const r = try runScriptOn(alloc, "zig-out/bin/with_custom_action", &.{}, &.{
+        .{ .send = "hello\x18\x15\n" }, // hello + Ctrl-X + Ctrl-U + Enter
+        .{ .send = "\x04" },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: HELLO") != null);
+    // Sanity: the literal 'x' or 'u' from the chord shouldn't leak
+    // into the buffer.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: hellox") == null);
+}

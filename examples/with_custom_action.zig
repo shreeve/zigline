@@ -1,14 +1,21 @@
 //! zigline example: application-defined custom actions.
 //!
-//! Two bindings are added beyond the emacs defaults:
+//! Three bindings are added beyond the emacs defaults:
 //!
-//!   `Ctrl-T`         uppercase the current buffer in place
-//!   `Ctrl-X`         open the buffer in `$EDITOR` (vi if unset)
+//!   `Ctrl-T`           uppercase the current buffer in place
+//!                      (single-key; via the legacy `lookupFn`)
+//!   `Ctrl-X Ctrl-U`    uppercase via a multi-key chord
+//!                      (binding-table; same action as Ctrl-T)
+//!   `Ctrl-X Ctrl-E`    open the buffer in `$EDITOR` (vi if unset)
+//!                      (binding-table; the canonical bash chord)
 //!
-//! The first demonstrates a pure-buffer transform (`replace_buffer`).
-//! The second is the canonical "edit-in-EDITOR" pattern: the hook
-//! pauses raw mode, spawns the editor, reads the result back, then
-//! returns `replace_buffer` so the new contents become the line.
+//! The first demonstrates a pure-buffer transform via single-key
+//! `lookupFn`. The second and third demonstrate the `BindingTable`
+//! overlay for multi-key sequences (matches bash's `Ctrl-X Ctrl-*`
+//! conventions). Ctrl-X Ctrl-E is the canonical "edit-in-EDITOR"
+//! pattern: the hook pauses raw mode, spawns the editor, reads the
+//! result back, then returns `replace_buffer` so the new contents
+//! become the line.
 //!
 //! Build and run:
 //!   zig build run-with_custom_action
@@ -26,12 +33,13 @@ const ActionId = enum(u32) {
     edit_in_editor = 2,
 };
 
+/// Single-key bindings get the legacy lookupFn; multi-key sequences
+/// go through the BindingTable overlay (set up in `main`).
 fn keymapLookup(key: zigline.KeyEvent) ?zigline.Action {
     if (key.mods.ctrl) {
         switch (key.code) {
             .char => |c| switch (c) {
                 't' => return zigline.Action{ .custom = @intFromEnum(ActionId.uppercase) },
-                'x' => return zigline.Action{ .custom = @intFromEnum(ActionId.edit_in_editor) },
                 else => {},
             },
             else => {},
@@ -140,8 +148,22 @@ fn spawnEditor(tmp_path: [:0]const u8) anyerror!u8 {
 pub fn main(init: std.process.Init) !u8 {
     const alloc = init.gpa;
 
+    // Multi-key sequences live in the BindingTable. Ctrl-X Ctrl-E
+    // is the bash canonical chord for "edit current line in
+    // $EDITOR." Bind it to our custom action.
+    var bindings = zigline.BindingTable.init(alloc);
+    defer bindings.deinit();
+    const ctrl_x = zigline.KeyEvent{ .code = .{ .char = 'x' }, .mods = .{ .ctrl = true } };
+    const ctrl_e = zigline.KeyEvent{ .code = .{ .char = 'e' }, .mods = .{ .ctrl = true } };
+    const ctrl_u = zigline.KeyEvent{ .code = .{ .char = 'u' }, .mods = .{ .ctrl = true } };
+    _ = try bindings.bind(&[_]zigline.KeyEvent{ ctrl_x, ctrl_e }, .{ .custom = @intFromEnum(ActionId.edit_in_editor) });
+    _ = try bindings.bind(&[_]zigline.KeyEvent{ ctrl_x, ctrl_u }, .{ .custom = @intFromEnum(ActionId.uppercase) });
+
     var editor = try zigline.Editor.init(alloc, .{
-        .keymap = .{ .lookupFn = keymapLookup },
+        .keymap = .{
+            .lookupFn = keymapLookup,
+            .bindings = &bindings,
+        },
         .custom_action = .{ .ctx = @ptrFromInt(0xa1b2c3), .invokeFn = customAction },
     });
     defer editor.deinit();

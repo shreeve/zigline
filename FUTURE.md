@@ -58,10 +58,11 @@ Two emacs editing primitives still pending here:
   `bestline.c::bestlineEditTransposeWords`.
 - **Mark and point (`Ctrl-Space` set mark, `Ctrl-X Ctrl-X` swap).**
   Set a position, jump back to it, swap cursor with mark. The
-  editor-state piece is small (one optional cursor field, two
-  action variants); the binding is the blocker — `Ctrl-X Ctrl-X`
-  is a multi-key chord, which needs the binding-table API
-  (v1.0 blocker). Reference: `bestline.c` (search for "mark").
+  binding-table now exists (shipped in v0.2.0), so the multi-key
+  `Ctrl-X Ctrl-X` chord is expressible. Remaining work: one
+  optional cursor field on `Editor`, two new action variants,
+  apps wire the bindings via `BindingTable.bind`. Reference:
+  `bestline.c` (search for "mark").
 
 ### Bigger features
 
@@ -87,9 +88,6 @@ Two emacs editing primitives still pending here:
   style. Reference: `reedline/src/hinter/`.
 - **Numeric arguments.** `M-3 C-f` for "move 3 words." Same machinery
   vi-mode repeat counts will need.
-- **Custom key bindings.** `Keymap` is currently swap-only; expose a
-  binding-table API so apps can override individual keys without
-  forking the keymap.
 - **Configurable word-boundary policy.** Currently word movement is
   whitespace-based; emacs uses `[A-Za-z0-9_]+`; vi has its own.
 - **Subword movement.** Cursor moves and word kills inside

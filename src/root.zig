@@ -78,7 +78,21 @@ pub const Action = @import("actions.zig").Action;
 pub const DispatchOutcome = @import("actions.zig").DispatchOutcome;
 
 /// `KeyEvent → Action` mapping. The default is `Keymap.defaultEmacs()`.
+/// `Keymap.bindings` (optional) plugs in a `BindingTable` overlay
+/// for multi-key sequences.
 pub const Keymap = @import("keymap.zig").Keymap;
+/// Storage for multi-key bindings (`Ctrl-X Ctrl-E` and friends).
+/// Owned by the application; pass via `Keymap.bindings`. See
+/// SPEC §5.1 / §5.2.
+pub const BindingTable = @import("keymap.zig").BindingTable;
+pub const BindingResult = @import("keymap.zig").BindingResult;
+pub const BindError = @import("keymap.zig").BindError;
+pub const MAX_KEY_SEQUENCE = @import("keymap.zig").MAX_SEQUENCE;
+/// Encode a `KeyEvent` to a 32-bit value (codepoint or named-key
+/// reserved value, plus modifier bits in the high bits). Returns
+/// null for unbindable kinds (`text`, `unknown`). Exposed for apps
+/// that want to build their own indices keyed on KeyEvent.
+pub const encodeKeyEvent = @import("keymap.zig").encodeKeyEvent;
 
 /// Multi-slot kill ring. Owned by `Editor`; size controlled via
 /// `Options.kill_ring_capacity`. Exposed for advanced use cases like
