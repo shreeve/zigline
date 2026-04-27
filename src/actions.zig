@@ -57,6 +57,14 @@ pub const Action = union(enum) {
     // `accept_line` clears the history so undo never crosses lines.
     undo,
     redo,
+
+    // Application-defined extension. The keymap returns
+    // `.custom = id` for app-specific keystrokes; the editor invokes
+    // `Options.custom_action` (if set) and applies the returned
+    // `CustomActionResult` (insert / replace / accept / cancel /
+    // no-op). The `id` is opaque to zigline — apps assign their own
+    // numeric labels.
+    custom: u32,
 };
 
 pub const DispatchOutcome = union(enum) {

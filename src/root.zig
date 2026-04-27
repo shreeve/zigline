@@ -110,6 +110,18 @@ pub const CompletionResult = @import("completion.zig").CompletionResult;
 pub const Candidate = @import("completion.zig").Candidate;
 pub const CandidateKind = @import("completion.zig").CandidateKind;
 
+/// Application-defined action hook. Bind a key to
+/// `Action{ .custom = id }` in your keymap, set `Options.custom_action`,
+/// and the editor invokes the hook with the buffer snapshot. Returned
+/// `CustomActionResult` tells the editor what to do (insert, replace,
+/// accept, cancel, no-op). For actions that spawn an external process
+/// (open `$EDITOR`, run a pager), use `CustomActionContext.pauseRawMode`
+/// + `resumeRawMode` to release/reclaim the terminal around the spawn.
+pub const CustomActionHook = @import("editor.zig").CustomActionHook;
+pub const CustomActionRequest = @import("editor.zig").CustomActionRequest;
+pub const CustomActionResult = @import("editor.zig").CustomActionResult;
+pub const CustomActionContext = @import("editor.zig").CustomActionContext;
+
 pub const HighlightHook = @import("highlight.zig").HighlightHook;
 /// Semantic span: a byte range + a style. The renderer sorts spans,
 /// drops overlaps, snaps endpoints to cluster boundaries, and emits

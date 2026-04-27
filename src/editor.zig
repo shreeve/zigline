@@ -69,6 +69,90 @@ pub const DiagnosticHook = struct {
     }
 };
 
+/// Snapshot passed to a `CustomActionHook`. Borrowed; valid only
+/// for the duration of `invokeFn`.
+pub const CustomActionRequest = struct {
+    /// Buffer contents at hook-call time.
+    buffer: []const u8,
+    /// Cursor byte offset (always at a grapheme cluster boundary).
+    cursor_byte: usize,
+};
+
+/// Capabilities the hook can use beyond reading buffer state. Kept
+/// minimal — the hook should not mutate the buffer through this;
+/// use the `CustomActionResult` return value for that. The
+/// pause/resume pair is the one capability hooks actually need that
+/// can't be expressed declaratively (spawning `$EDITOR`/pager).
+pub const CustomActionContext = struct {
+    editor: *Editor,
+
+    /// Finalize the rendered block + leave raw mode. Cursor lands
+    /// on a fresh row; the terminal is in cooked mode. Hooks call
+    /// this before spawning a process that reads from / writes to
+    /// stdin/stdout (an editor, pager, password prompt). Pairs with
+    /// `resumeRawMode`. Idempotent: calling twice is safe.
+    pub fn pauseRawMode(self: CustomActionContext) !void {
+        try self.editor.renderer.finalize(&self.editor.terminal);
+        self.editor.terminal.leaveRawMode();
+    }
+
+    /// Re-enter raw mode after `pauseRawMode`. Marks the renderer
+    /// fresh — the next render draws from a clean row. Spawned
+    /// processes typically leave the cursor wherever they left it,
+    /// so there's no guarantee of column 0; the hook should ensure
+    /// the spawned process exited with a newline if visual layout
+    /// matters.
+    pub fn resumeRawMode(self: CustomActionContext) !void {
+        try self.editor.terminal.enterRawMode();
+        self.editor.renderer.markFresh();
+    }
+};
+
+/// What the editor should do after the hook returns. Constraining
+/// outcomes to a closed set (rather than handing the hook a `*Editor`
+/// with mutation rights) keeps the buffer's UTF-8 + cluster
+/// invariants under the editor's control.
+pub const CustomActionResult = union(enum) {
+    /// Hook ran, no buffer change. (E.g. printed help to stderr,
+    /// recorded analytics, opened an external help overlay.)
+    no_op,
+    /// Insert this text at the cursor. Editor records as a normal
+    /// undo step. Allocator-owned by the hook (allocator passed
+    /// into `invokeFn`); editor frees after applying.
+    insert_text: []const u8,
+    /// Replace the entire buffer. Cursor lands at end of `text`.
+    /// Recorded as a single `Replace` undo op so one Ctrl-_
+    /// unwinds. Allocator-owned; editor frees after applying.
+    replace_buffer: []const u8,
+    /// Submit the current buffer as the accepted line.
+    accept_line,
+    /// Discard the current buffer; surface `interrupt` to caller.
+    cancel_line,
+};
+
+pub const CustomActionHook = struct {
+    ctx: *anyopaque,
+    /// Called when the keymap returns `Action.custom = id`. The
+    /// hook receives:
+    ///   - `allocator`: same allocator the editor uses; results
+    ///     containing text (`insert_text`, `replace_buffer`) must
+    ///     allocate from this allocator. The editor frees after use.
+    ///   - `id`: the value the keymap returned. Apps assign their
+    ///     own labels (typically `enum(u32)` constants).
+    ///   - `request`: buffer + cursor snapshot.
+    ///   - `action_ctx`: capability handle (raw-mode pause/resume).
+    ///
+    /// Hook errors are reported via the diagnostic hook (if set)
+    /// and treated as no-op for the buffer.
+    invokeFn: *const fn (
+        ctx: *anyopaque,
+        allocator: Allocator,
+        id: u32,
+        request: CustomActionRequest,
+        action_ctx: CustomActionContext,
+    ) anyerror!CustomActionResult,
+};
+
 pub const Options = struct {
     input_fd: std.posix.fd_t = std.posix.STDIN_FILENO,
     output_fd: std.posix.fd_t = std.posix.STDOUT_FILENO,
@@ -89,6 +173,12 @@ pub const Options = struct {
     /// 0 to disable kill-ring tracking entirely; the kill actions
     /// still delete text but won't be recoverable via yank.
     kill_ring_capacity: usize = 32,
+    /// Optional hook for application-defined actions. The keymap
+    /// returns `Action{ .custom = id }`; the editor invokes this
+    /// hook with `id` plus the buffer snapshot and applies the
+    /// returned `CustomActionResult`. Null disables; keymaps that
+    /// never return a `.custom` action don't need to set this.
+    custom_action: ?CustomActionHook = null,
 };
 
 /// The line editor.
@@ -370,6 +460,81 @@ pub const Editor = struct {
         };
     }
 
+    fn handleCustomAction(self: *Editor, id: u32) !?ReadLineResult {
+        const hook = self.options.custom_action orelse return null;
+        const result = hook.invokeFn(
+            hook.ctx,
+            self.allocator,
+            id,
+            .{
+                .buffer = self.buffer.slice(),
+                .cursor_byte = self.buffer.cursor_byte,
+            },
+            .{ .editor = self },
+        ) catch |err| {
+            self.diag(.{ .kind = .completion_hook_failed, .err = err, .detail = "custom_action hook failed" });
+            return null;
+        };
+
+        switch (result) {
+            .no_op => return null,
+            .insert_text => |t| {
+                defer self.allocator.free(t);
+                if (!std.unicode.utf8ValidateSlice(t)) {
+                    self.diag(.{ .kind = .completion_invalid_candidate, .detail = "custom_action insert_text not UTF-8" });
+                    return null;
+                }
+                if (t.len == 0) return null;
+                const cursor_before = self.buffer.cursor_byte;
+                self.changeset.breakSequence();
+                try self.buffer.insertText(t);
+                self.recordInsertOrDiag(cursor_before, t, cursor_before, self.buffer.cursor_byte);
+                self.changeset.breakSequence();
+                return null;
+            },
+            .replace_buffer => |t| {
+                defer self.allocator.free(t);
+                if (!std.unicode.utf8ValidateSlice(t)) {
+                    self.diag(.{ .kind = .completion_invalid_candidate, .detail = "custom_action replace_buffer not UTF-8" });
+                    return null;
+                }
+                const old = try self.allocator.dupe(u8, self.buffer.slice());
+                defer self.allocator.free(old);
+                const cursor_before = self.buffer.cursor_byte;
+                try self.buffer.replaceAll(t);
+                self.recordReplaceOrDiag(0, old, t, cursor_before, self.buffer.cursor_byte);
+                self.changeset.breakSequence();
+                return null;
+            },
+            .accept_line => {
+                try self.renderer.finalize(&self.terminal);
+                const out = try self.buffer.take();
+                self.changeset.clear();
+                if (self.options.history) |h| {
+                    if (out.len > 0) {
+                        h.append(out) catch |err| {
+                            self.diag(.{ .kind = .history_append_failed, .err = err });
+                        };
+                    }
+                }
+                return ReadLineResult{ .line = out };
+            },
+            .cancel_line => {
+                try self.renderer.finalize(&self.terminal);
+                // Echo `^C` ourselves only when raw mode is active —
+                // in cooked mode the kernel discipline already echoes
+                // the interrupt indicator for us.
+                if (self.options.raw_mode != .disabled and self.terminal.isInputTty()) {
+                    self.terminal.writeAll("^C\r\n") catch {};
+                }
+                self.buffer.clear();
+                self.changeset.clear();
+                self.renderer.markFresh();
+                return ReadLineResult{ .interrupt = {} };
+            },
+        }
+    }
+
     /// Best-effort record helpers: if recording fails (OOM), the
     /// edit has already happened, so we surface the failure via the
     /// diagnostic hook and continue. The buffer state is correct;
@@ -586,6 +751,7 @@ pub const Editor = struct {
                 self.renderer.markFresh();
                 _ = std.c.raise(.TSTP);
             },
+            .custom => |id| return try self.handleCustomAction(id),
         }
         return null;
     }
@@ -1102,6 +1268,150 @@ test "editor: invalid candidate UTF-8 fires diagnostic, leaves buffer untouched"
     );
     try std.testing.expectEqualStrings("hi", editor.buffer.slice());
 }
+
+// Test plumbing: a per-test callback context. Tests provide the
+// next result they want returned; the callback dupes any text via
+// the editor-supplied allocator (the editor frees after applying).
+const CATestCtx = struct {
+    next: CustomActionResult = .no_op,
+    invoked: bool = false,
+    last_id: u32 = 0,
+    last_buffer_len: usize = 0,
+    last_cursor: usize = 0,
+};
+
+fn caTestCb(
+    ctx: *anyopaque,
+    allocator: Allocator,
+    id: u32,
+    request: CustomActionRequest,
+    action_ctx: CustomActionContext,
+) anyerror!CustomActionResult {
+    _ = action_ctx;
+    const self: *CATestCtx = @ptrCast(@alignCast(ctx));
+    self.invoked = true;
+    self.last_id = id;
+    self.last_buffer_len = request.buffer.len;
+    self.last_cursor = request.cursor_byte;
+    return switch (self.next) {
+        .insert_text => |t| CustomActionResult{ .insert_text = try allocator.dupe(u8, t) },
+        .replace_buffer => |t| CustomActionResult{ .replace_buffer = try allocator.dupe(u8, t) },
+        .no_op => .no_op,
+        .accept_line => .accept_line,
+        .cancel_line => .cancel_line,
+    };
+}
+
+fn caHook(ctx: *CATestCtx) CustomActionHook {
+    return .{ .ctx = @ptrCast(ctx), .invokeFn = caTestCb };
+}
+
+test "editor: custom action no_op invokes hook with correct snapshot" {
+    var ctx: CATestCtx = .{};
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .custom_action = caHook(&ctx),
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("foobar");
+    editor.buffer.cursor_byte = 3;
+    _ = try editor.handleCustomAction(42);
+
+    try std.testing.expect(ctx.invoked);
+    try std.testing.expectEqual(@as(u32, 42), ctx.last_id);
+    try std.testing.expectEqual(@as(usize, 6), ctx.last_buffer_len);
+    try std.testing.expectEqual(@as(usize, 3), ctx.last_cursor);
+    try std.testing.expectEqualStrings("foobar", editor.buffer.slice());
+}
+
+test "editor: custom action insert_text inserts at cursor" {
+    var ctx: CATestCtx = .{ .next = .{ .insert_text = "INS" } };
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .custom_action = caHook(&ctx),
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("abcd");
+    editor.buffer.cursor_byte = 2;
+    editor.changeset.breakSequence();
+    _ = try editor.handleCustomAction(0);
+
+    try std.testing.expectEqualStrings("abINScd", editor.buffer.slice());
+    try std.testing.expect(editor.changeset.canUndo());
+}
+
+test "editor: custom action replace_buffer swaps via single Replace op" {
+    var ctx: CATestCtx = .{ .next = .{ .replace_buffer = "fresh" } };
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .custom_action = caHook(&ctx),
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("stale");
+    editor.changeset.breakSequence();
+    _ = try editor.handleCustomAction(0);
+
+    try std.testing.expectEqualStrings("fresh", editor.buffer.slice());
+    const op = editor.changeset.peekUndo().?;
+    try std.testing.expect(op.* == .replace);
+}
+
+test "editor: custom action rejects invalid UTF-8 in insert_text" {
+    var ctx: CATestCtx = .{ .next = .{ .insert_text = "\xFF\xFE" } };
+    var diag_ctx: DiagTestCtx = .{};
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .custom_action = caHook(&ctx),
+        .diagnostic = diag_ctx.hook(),
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("hello");
+    _ = try editor.handleCustomAction(0);
+
+    try std.testing.expectEqualStrings("hello", editor.buffer.slice());
+    try std.testing.expect(diag_ctx.count >= 1);
+}
+
+test "editor: custom action accept_line surfaces buffer as line" {
+    var ctx: CATestCtx = .{ .next = .accept_line };
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .custom_action = caHook(&ctx),
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("submitted");
+    const result = try editor.handleCustomAction(0);
+    try std.testing.expect(result != null);
+    switch (result.?) {
+        .line => |line| {
+            defer std.testing.allocator.free(line);
+            try std.testing.expectEqualStrings("submitted", line);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "editor: custom action cancel_line returns interrupt + clears state" {
+    var ctx: CATestCtx = .{ .next = .cancel_line };
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .custom_action = caHook(&ctx),
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("discarded");
+    const result = try editor.handleCustomAction(0);
+    try std.testing.expect(result != null);
+    try std.testing.expect(result.? == .interrupt);
+    try std.testing.expectEqualStrings("", editor.buffer.slice());
+    try std.testing.expect(!editor.changeset.canUndo());
+}
+
 
 test "editor: isClusterBoundary catches mid-cluster offsets" {
     // "café" at byte 4 is mid-é (cluster spans [3, 5)).

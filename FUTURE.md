@@ -76,8 +76,6 @@ concrete bullet list.
 
 ## API
 
-- **Custom actions.** Application-defined `Action.custom: u32` channel
-  so apps can wire keys to behaviors zigline doesn't know about.
 - **Async completion.** Completion provider returns a future / token
   the editor polls; UX shows "computing…" while in flight.
 - **Narrower error sets.** v0.1 hooks return `anyerror`; tighten to

@@ -29,8 +29,9 @@ pub fn main(init: std.process.Init) !u8 {
 }
 ```
 
-See `examples/with_history.zig`, `examples/with_completion.zig`, and
-`examples/with_highlight.zig` for the hook-based extension points.
+See `examples/with_history.zig`, `examples/with_completion.zig`,
+`examples/with_highlight.zig`, and `examples/with_custom_action.zig`
+for the hook-based extension points.
 
 ## What zigline gets right
 
