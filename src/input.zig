@@ -78,6 +78,10 @@ const READ_BUF_SIZE = 256;
 pub const Reader = struct {
     allocator: Allocator,
     fd: std.posix.fd_t,
+    /// Optional read end of the signal self-pipe. When >=0, every
+    /// blocking read also polls on this fd; readability surfaces
+    /// non-keystroke events (resize, suspend/resume).
+    signal_pipe_fd: c_int = -1,
     /// Pending bytes from a previous read, not yet consumed by the
     /// state machine (e.g. partial CSI).
     pending: [READ_BUF_SIZE]u8 = undefined,
@@ -85,6 +89,10 @@ pub const Reader = struct {
     /// Owned buffer for paste / unknown / text events; the returned
     /// event borrows from this and is valid only until the next call.
     scratch: std.ArrayListUnmanaged(u8) = .empty,
+    /// Set whenever a signal-pipe drain saw at least one byte, so
+    /// the next `next()` call can yield `Event.resize` before going
+    /// back to the keystroke read.
+    signal_pending: bool = false,
 
     pub fn init(allocator: Allocator, fd: std.posix.fd_t) Reader {
         return .{ .allocator = allocator, .fd = fd };
@@ -94,28 +102,58 @@ pub const Reader = struct {
         self.scratch.deinit(self.allocator);
     }
 
+    /// Set or clear the signal self-pipe read fd. Called by the
+    /// editor after entering raw mode (where the pipe is created)
+    /// and again on leaveRawMode to clear it.
+    pub fn setSignalPipe(self: *Reader, fd: c_int) void {
+        self.signal_pipe_fd = fd;
+    }
+
     /// Block until the next event is available.
     pub fn next(self: *Reader) Event {
+        // Drain any signal byte queued from the previous wake — emit
+        // one .resize event per call so the editor can render once
+        // even if multiple signals coalesced.
+        if (self.signal_pending) {
+            self.signal_pending = false;
+            return .resize;
+        }
         while (true) {
             const byte = self.readByte() catch |err| switch (err) {
                 error.Eof => return .eof,
+                error.SignalEvent => {
+                    self.signal_pending = false;
+                    return .resize;
+                },
                 else => return .{ .error_ = err },
             };
             if (self.dispatch(byte)) |ev| return ev;
         }
     }
 
-    /// Read one byte, blocking. Loops on EINTR/EAGAIN — `next` should
-    /// not need to know about transient interruption. EOF and hard
-    /// read errors propagate.
+    /// Read one byte, blocking. Loops on EINTR/EAGAIN. Returns
+    /// `error.SignalEvent` if the signal self-pipe woke us; the
+    /// caller should surface this as an `Event.resize` and try again.
     fn readByte(self: *Reader) !u8 {
         if (self.pending_len > 0) return self.popPending();
+        if (self.signal_pipe_fd >= 0) {
+            try self.waitForReadable();
+        }
         var byte: [1]u8 = undefined;
         while (true) {
             const n = std.c.read(self.fd, &byte, 1);
             if (n < 0) {
                 const e = std.c.errno(@as(c_int, -1));
-                if (e == .INTR or e == .AGAIN) continue;
+                if (e == .INTR or e == .AGAIN) {
+                    // EINTR after a poll means a signal arrived
+                    // between poll() and read(); treat it as a
+                    // signal-event so the read loop re-renders.
+                    if (self.signal_pipe_fd >= 0) {
+                        self.drainSignalBytes();
+                        return error.SignalEvent;
+                    }
+                    continue;
+                }
                 return error.ReadFailed;
             }
             if (n == 0) return error.Eof;
@@ -123,25 +161,92 @@ pub const Reader = struct {
         }
     }
 
+    /// Block on poll() of {tty_fd, signal_pipe_fd}. Returns when the
+    /// tty has a byte ready. If the signal pipe wakes first, drain
+    /// and return `error.SignalEvent` so the caller surfaces a
+    /// resize event.
+    fn waitForReadable(self: *Reader) !void {
+        var pfds: [2]std.c.pollfd = .{
+            .{ .fd = self.fd, .events = std.c.POLL.IN, .revents = 0 },
+            .{ .fd = self.signal_pipe_fd, .events = std.c.POLL.IN, .revents = 0 },
+        };
+        while (true) {
+            const rc = std.c.poll(@ptrCast(&pfds), 2, -1);
+            if (rc < 0) {
+                const e = std.c.errno(rc);
+                if (e == .INTR) {
+                    self.drainSignalBytes();
+                    return error.SignalEvent;
+                }
+                return error.ReadFailed;
+            }
+            if (pfds[1].revents & std.c.POLL.IN != 0) {
+                self.drainSignalBytes();
+                return error.SignalEvent;
+            }
+            if (pfds[0].revents & std.c.POLL.IN != 0) return;
+            // Spurious wake: loop.
+        }
+    }
+
+    fn drainSignalBytes(self: *Reader) void {
+        if (self.signal_pipe_fd < 0) return;
+        var buf: [16]u8 = undefined;
+        while (true) {
+            const n = std.c.read(self.signal_pipe_fd, &buf, buf.len);
+            if (n <= 0) break;
+        }
+    }
+
     /// Read one byte with a millisecond-bounded wait. Used for escape
     /// sequence disambiguation: bare ESC must time out within ~50ms
     /// instead of hanging forever, while CSI/SS3 sequence bodies
     /// (whose bytes are sent back-to-back by every real terminal)
-    /// resolve well within the window.
+    /// resolve well within the window. If the signal self-pipe is
+    /// active, also polls it and stashes a pending resize for the
+    /// next `next()` call.
     fn readByteWithin(self: *Reader, timeout_ms: i32) ?u8 {
         if (self.pending_len > 0) return self.popPending();
-        var pfd: std.c.pollfd = .{ .fd = self.fd, .events = std.c.POLL.IN, .revents = 0 };
+        if (self.signal_pipe_fd < 0) {
+            var pfd: std.c.pollfd = .{ .fd = self.fd, .events = std.c.POLL.IN, .revents = 0 };
+            while (true) {
+                const rc = std.c.poll(@ptrCast(&pfd), 1, timeout_ms);
+                if (rc < 0) {
+                    if (std.c.errno(rc) == .INTR) continue;
+                    return null;
+                }
+                if (rc == 0) return null;
+                break;
+            }
+            return self.readByte() catch null;
+        }
+        var pfds: [2]std.c.pollfd = .{
+            .{ .fd = self.fd, .events = std.c.POLL.IN, .revents = 0 },
+            .{ .fd = self.signal_pipe_fd, .events = std.c.POLL.IN, .revents = 0 },
+        };
         while (true) {
-            const rc = std.c.poll(@ptrCast(&pfd), 1, timeout_ms);
+            const rc = std.c.poll(@ptrCast(&pfds), 2, timeout_ms);
             if (rc < 0) {
-                const e = std.c.errno(rc);
-                if (e == .INTR) continue;
+                if (std.c.errno(rc) == .INTR) {
+                    self.drainSignalBytes();
+                    self.signal_pending = true;
+                    continue;
+                }
                 return null;
             }
-            if (rc == 0) return null; // timeout
-            break;
+            if (rc == 0) return null;
+            if ((pfds[1].revents & std.c.POLL.IN) != 0) {
+                self.drainSignalBytes();
+                self.signal_pending = true;
+            }
+            if ((pfds[0].revents & std.c.POLL.IN) != 0) {
+                return self.readByte() catch null;
+            }
+            // Only the signal pipe woke us; this is a "timeout" from
+            // the parser's perspective — it'll fall back to ESC and
+            // the next `next()` call surfaces the resize.
+            if (self.signal_pending) return null;
         }
-        return self.readByte() catch null;
     }
 
     fn popPending(self: *Reader) u8 {
@@ -158,7 +263,6 @@ pub const Reader = struct {
     fn pushBack(self: *Reader, byte: u8) void {
         if (self.pending_len >= self.pending.len) return; // drop on overflow
         if (self.pending_len > 0) {
-            // Shift right by one to make room at index 0.
             std.mem.copyBackwards(
                 u8,
                 self.pending[1 .. self.pending_len + 1],
@@ -167,6 +271,17 @@ pub const Reader = struct {
         }
         self.pending[0] = byte;
         self.pending_len += 1;
+    }
+
+    /// Push a slice of bytes back to the front of the pending queue,
+    /// preserving their order on subsequent reads. Used to recover
+    /// consumed bytes after a CSI / SS3 sequence times out mid-parse.
+    fn pushBackBytes(self: *Reader, bytes: []const u8) void {
+        var i = bytes.len;
+        while (i > 0) {
+            i -= 1;
+            self.pushBack(bytes[i]);
+        }
     }
 
     fn dispatch(self: *Reader, b0: u8) ?Event {
@@ -263,7 +378,18 @@ pub const Reader = struct {
         var plen: usize = 0;
         var final: u8 = 0;
         while (true) {
-            const b = self.readByteWithin(50) orelse return .{ .key = .{ .code = .escape } };
+            const b = self.readByteWithin(50) orelse {
+                // Timeout: terminal didn't finish the CSI sequence.
+                // Push back the bytes we already consumed (`[` plus
+                // any params) so the next reads re-dispatch them as
+                // ordinary keystrokes — silent data loss is far
+                // worse than a misread on a slow link. Pattern lifted
+                // from isocline (`tty_esc.c:255`, the `// recover`
+                // comment).
+                self.pushBackBytes(params[0..plen]);
+                self.pushBack('[');
+                return .{ .key = .{ .code = .escape } };
+            };
             if (b >= 0x40 and b <= 0x7e) {
                 final = b;
                 break;
@@ -313,7 +439,13 @@ pub const Reader = struct {
     }
 
     fn parseSs3(self: *Reader) ?Event {
-        const b = self.readByteWithin(50) orelse return .{ .key = .{ .code = .escape } };
+        const b = self.readByteWithin(50) orelse {
+            // Same recovery as parseCsi: push the consumed `O` back
+            // so the user sees ESC + 'O' separately rather than
+            // losing the keystroke entirely.
+            self.pushBack('O');
+            return .{ .key = .{ .code = .escape } };
+        };
         return switch (b) {
             'A' => .{ .key = .{ .code = .arrow_up } },
             'B' => .{ .key = .{ .code = .arrow_down } },
@@ -587,5 +719,68 @@ test "input: SS3 function keys" {
             .function => |f| try std.testing.expectEqual(want, f),
             else => return error.TestUnexpectedResult,
         }
+    }
+}
+
+test "input: CSI timeout pushes consumed bytes back" {
+    // ESC + '[' + '1' + ';' + '5' with no final byte — historically
+    // this dropped all five bytes; now they recover as ordinary
+    // events: escape, '[', '1', ';', '5'.
+    const pp = try PipePair.open();
+    defer pp.close();
+
+    var r = Reader.init(std.testing.allocator, pp.read);
+    defer r.deinit();
+
+    try pp.writeAll("\x1b[1;5");
+    // Close the write end so the reader sees EOF after timeout.
+    _ = std.c.close(pp.write);
+
+    try std.testing.expectEqual(KeyCode.escape, r.next().key.code);
+    {
+        const ev = r.next().key;
+        switch (ev.code) {
+            .char => |c| try std.testing.expectEqual(@as(u21, '['), c),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    {
+        const ev = r.next().key;
+        switch (ev.code) {
+            .char => |c| try std.testing.expectEqual(@as(u21, '1'), c),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    {
+        const ev = r.next().key;
+        switch (ev.code) {
+            .char => |c| try std.testing.expectEqual(@as(u21, ';'), c),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    {
+        const ev = r.next().key;
+        switch (ev.code) {
+            .char => |c| try std.testing.expectEqual(@as(u21, '5'), c),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "input: SS3 timeout pushes back the 'O'" {
+    const pp = try PipePair.open();
+    defer pp.close();
+
+    var r = Reader.init(std.testing.allocator, pp.read);
+    defer r.deinit();
+
+    try pp.writeAll("\x1bO");
+    _ = std.c.close(pp.write);
+
+    try std.testing.expectEqual(KeyCode.escape, r.next().key.code);
+    const ev = r.next().key;
+    switch (ev.code) {
+        .char => |c| try std.testing.expectEqual(@as(u21, 'O'), c),
+        else => return error.TestUnexpectedResult,
     }
 }

@@ -41,6 +41,11 @@ pub const Action = union(enum) {
     // Display.
     clear_screen,
     redraw,
+
+    // Job control. Suspend self via SIGTSTP — the editor's signal
+    // handler restores cooked termios, re-raises with default
+    // disposition, and on resume re-enters raw mode + repaints.
+    suspend_self,
 };
 
 pub const DispatchOutcome = union(enum) {

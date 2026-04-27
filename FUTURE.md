@@ -32,15 +32,21 @@ concrete bullet list.
   via the CSI 1;mod sequences.
 - **Mouse input.** SGR mouse mode (`\x1b[?1006h`) for click-to-position-
   cursor.
-- **Bare-Escape disambiguation.** Currently bare ESC may collide with
-  the start of a CSI sequence on slow terminals. A small timeout
-  (≤50ms) disambiguates; for v0.1 we don't, so bare ESC is delivered
-  on the next read.
+- **Configurable parser timeouts.** ESC / CSI body / UTF-8
+  continuation timeouts are hardcoded at 50ms. Cross-network terminals
+  with packetization delays >50ms misread CSI sequences as bare ESC.
+  Surface the three values via `Options.timeouts` (sub-struct so
+  they evolve independently).
 
 ## Editor / UX
 
 - **vi-mode keymap.** Modal editing with normal/insert/visual states.
-- **Reverse-incremental history search.** Ctrl-R style overlay UI.
+  Reference: `readline/vi_mode.c` for the state machine, `rustyline/src/keymap.rs`
+  + `command.rs` for the cleaner Rust factoring.
+- **Reverse-incremental history search.** Ctrl-R style overlay UI
+  with separate search prompt, failed-search retention, repeat-Ctrl-R
+  for older matches, Ctrl-G abort with line restore. Reference:
+  `readline/isearch.c`.
 - **Frecency history sort.** Frequency × recency weighted ranking
   for history navigation, especially for fzf-style history overlays.
 - **History metadata.** Timestamp, exit code, cwd, duration per entry.
@@ -48,15 +54,36 @@ concrete bullet list.
 - **Multi-line text-area mode.** Buffer can contain `\n`; cursor
   moves between rows of one logical entry. Useful for pasting code
   blocks into a REPL. Requires bigger render rework.
+- **Validator hook.** "Is this expression complete?" callback so a
+  REPL can decide whether Enter accepts the line or inserts a newline.
+  Pairs with multi-line text-area mode. Reference: `rustyline/src/validate.rs`,
+  `reedline/src/validator/`.
+- **Hints (ghost text).** Right-of-cursor suggestion rendering. Fish-
+  style. Reference: `reedline/src/hinter/`.
+- **Undo / redo.** Emacs `C-_` and vi `u`. Reference: `rustyline/src/undo.rs`.
+- **Kill ring with `M-y` yank-pop.** Multi-slot kill history; current
+  Ctrl-W / Ctrl-U / Ctrl-K just discard. Reference: `rustyline/src/kill_ring.rs`,
+  `replxx/src/killring.hxx`.
+- **Numeric arguments.** `M-3 C-f` for "move 3 words." Same machinery
+  vi-mode repeat counts will need.
+- **Custom key bindings.** `Keymap` is currently swap-only; expose a
+  binding-table API so apps can override individual keys without
+  forking the keymap.
 - **Configurable word-boundary policy.** Currently word movement is
   whitespace-based; emacs uses `[A-Za-z0-9_]+`; vi has its own.
 - **Completion-while-typing.** Filter candidates as the user types
   more characters. Requires async or at least debounced completion.
+- **Atomic history under concurrent processes.** `persistAppend` is
+  EINTR/partial-write safe but two shells writing the same file race.
+  Reference: `readline/histfile.c` for file-locking, `rustyline/src/history.rs`
+  for tmp+rename.
+- **`dedupe=.all` history-file compaction.** Currently dedup is
+  applied at load and append in memory; the on-disk file still grows
+  duplicates. Periodic atomic rewrite (`tmp + fsync + rename`) would
+  reconcile.
 
 ## API
 
-- **Diagnostic-fn for hook errors.** Caller registers a callback the
-  editor invokes with structured info when a hook fails.
 - **Custom actions.** Application-defined `Action.custom: u32` channel
   so apps can wire keys to behaviors zigline doesn't know about.
 - **Async completion.** Completion provider returns a future / token
@@ -86,9 +113,26 @@ concrete bullet list.
 - **`NO_COLOR` env.** Honor [no-color.org](https://no-color.org/)
   convention.
 - **`COLORTERM=truecolor`.** Detect for 24-bit color decisions.
+- **`TERM=dumb` fallback.** Skip cursor-motion escapes entirely on
+  dumb terminals; degrade to plain echo. Useful for emacs `M-x shell`
+  and CI logs.
+- **`signal_policy=.shell_friendly`.** Lets the application opt into
+  kernel SIGINT delivery so the shell's own SIGINT handler can
+  interrupt blocking child syscalls in a pipeline. Reference:
+  `readline/signals.c` + `rltty.c`.
+- **Self-pipe wakeup hook for application-installed signals.** We
+  install our own SIGWINCH/SIGTSTP/SIGCONT handlers; if the
+  application has its own (e.g. for SIGUSR1), they need a way to
+  also poke our self-pipe. Expose `Editor.notifyResize` semantics
+  generically.
 - **Windows native (cmd.exe, Windows Terminal).** Currently POSIX-only.
 - **Alt-screen for completion menus.** Long candidate lists could
   pop into the alt-screen, scroll, return on selection.
+- **Rich completion menu UI.** Multi-column / paged / keyboard-
+  navigable menu rather than the current single-line space-separated
+  list. Reference: `reedline/src/menu/` for a modern model that
+  separates source / candidate model / replacement range / layout /
+  selection / painter.
 - **Title-bar updates.** `\x1b]0;TITLE\x07` integration as a hook.
 
 ## Tests

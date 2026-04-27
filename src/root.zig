@@ -40,6 +40,12 @@ pub const RawModePolicy = @import("editor.zig").RawModePolicy;
 /// (multi-line pastes collapse to space-separated single line).
 pub const PastePolicy = @import("editor.zig").PastePolicy;
 
+/// Categorized failure delivered to `Options.diagnostic` when a hook
+/// returns an error or invalid data. Library behavior stays
+/// nonfatal; this is a debugging surface for embedders.
+pub const Diagnostic = @import("editor.zig").Diagnostic;
+pub const DiagnosticHook = @import("editor.zig").DiagnosticHook;
+
 // =============================================================================
 // Buffer / Prompt / input event types
 // =============================================================================

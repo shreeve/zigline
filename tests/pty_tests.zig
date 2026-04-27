@@ -423,6 +423,58 @@ test "pty: bracketed paste sanitizes invalid UTF-8 to FFFD" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "a\xEF\xBF\xBD b") != null);
 }
 
+test "pty: terminal resize wakes the read loop and keeps editing intact" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const pty = try PtyPair.open();
+    setWinsize(pty.master, 24, 80);
+
+    // Spawn manually so we can resize the PTY mid-edit.
+    const child = blk: {
+        const pid = std.c.fork();
+        if (pid < 0) return error.ForkFailed;
+        if (pid == 0) {
+            _ = std.c.close(pty.master);
+            _ = setsid();
+            _ = std.c.dup2(pty.slave, 0);
+            _ = std.c.dup2(pty.slave, 1);
+            _ = std.c.dup2(pty.slave, 2);
+            if (pty.slave > 2) _ = std.c.close(pty.slave);
+            const bin_z = "zig-out/bin/minimal\x00";
+            const argv: [2]?[*:0]const u8 = .{ @ptrCast(bin_z.ptr), null };
+            const envp: [*:null]const ?[*:0]const u8 = @ptrCast(@alignCast(std.c.environ));
+            _ = std.c.execve(bin_z.ptr, @ptrCast(&argv), envp);
+            std.c._exit(127);
+        }
+        _ = std.c.close(pty.slave);
+        break :blk Spawned{ .pid = pid, .master = pty.master };
+    };
+    defer child.close();
+
+    var collected: std.ArrayListUnmanaged(u8) = .empty;
+    defer collected.deinit(alloc);
+
+    // Type half the line.
+    try child.send("hello ");
+    try child.drain(alloc, &collected, 100);
+
+    // Shrink the terminal mid-edit. SIGWINCH wakes our blocked
+    // read; the renderer scrolls past the stale block and re-draws
+    // on the next render. Give the handler a moment.
+    setWinsize(pty.master, 24, 40);
+    try child.drain(alloc, &collected, 100);
+
+    // Continue typing, accept, EOF.
+    try child.send("world\n");
+    try child.send("\x04");
+    try child.drain(alloc, &collected, 1500);
+    const status = child.reap();
+
+    try std.testing.expectEqual(@as(u8, 0), status);
+    try std.testing.expect(std.mem.indexOf(u8, collected.items, "got: hello world") != null);
+}
+
 test "pty: bare ESC does not hang the editor" {
     if (!ptySupported()) return error.SkipZigTest;
 

@@ -36,6 +36,37 @@ pub const PastePolicy = enum {
     accept,
 };
 
+/// Categorized diagnostic delivered to `Options.diagnostic_fn` when
+/// a hook fails or a hook returns invalid data. The library degrades
+/// gracefully — a failing highlighter just produces no spans, a
+/// failing completer produces no candidates — but the failure is
+/// observable so embedders aren't debugging in the dark.
+pub const Diagnostic = struct {
+    pub const Kind = enum {
+        completion_hook_failed,
+        completion_invalid_range,
+        completion_invalid_candidate,
+        highlight_hook_failed,
+        history_append_failed,
+        render_failed,
+    };
+
+    kind: Kind,
+    err: ?anyerror = null,
+    /// Optional human-readable detail. Borrowed; valid only for the
+    /// duration of the callback.
+    detail: ?[]const u8 = null,
+};
+
+pub const DiagnosticHook = struct {
+    ctx: *anyopaque,
+    fn_: *const fn (ctx: *anyopaque, diag: Diagnostic) void,
+
+    pub fn report(self: DiagnosticHook, diag: Diagnostic) void {
+        self.fn_(self.ctx, diag);
+    }
+};
+
 pub const Options = struct {
     input_fd: std.posix.fd_t = std.posix.STDIN_FILENO,
     output_fd: std.posix.fd_t = std.posix.STDOUT_FILENO,
@@ -46,6 +77,11 @@ pub const Options = struct {
     highlight: ?highlight_mod.HighlightHook = null,
     width_policy: grapheme.WidthPolicy = .{},
     paste: PastePolicy = .accept,
+    /// Optional callback invoked when a hook fails or returns
+    /// invalid data. Library behavior stays nonfatal; this is a
+    /// debugging surface for embedders. Not called in hot paths
+    /// when nothing has gone wrong.
+    diagnostic: ?DiagnosticHook = null,
 };
 
 /// The line editor.
@@ -108,7 +144,15 @@ pub const Editor = struct {
         if (self.options.raw_mode == .enter_and_leave) {
             try self.terminal.enterRawMode();
         }
-        defer if (self.options.raw_mode == .enter_and_leave) self.terminal.leaveRawMode();
+        defer {
+            self.reader.setSignalPipe(-1);
+            if (self.options.raw_mode == .enter_and_leave) self.terminal.leaveRawMode();
+        }
+
+        // Wire the signal self-pipe into the reader so SIGWINCH /
+        // SIGTSTP-resume / app-initiated `notifyResize` wakes our
+        // blocked `read()`.
+        self.reader.setSignalPipe(self.terminal.signalPipeFd());
 
         self.buffer.clear();
         self.renderer.markFresh();
@@ -142,16 +186,16 @@ pub const Editor = struct {
         }
     }
 
-    /// Application hook to signal a terminal resize. Currently a
-    /// no-op: the renderer already queries terminal size on every
-    /// render and detects width changes from cached state, so
-    /// resize is reflected on the next user keystroke. Wiring this
-    /// to actually wake up a blocked `read` requires a self-pipe
-    /// that the read loop polls — that's a v0.2 API addition.
-    /// Documented here as a stable hook so downstream apps don't
-    /// have to change their call sites later.
+    /// Application hook to signal a terminal resize. Writes a wake
+    /// byte to the editor's self-pipe so a blocked `read()` returns
+    /// immediately and the next render picks up the new dimensions.
+    /// Async-signal-safe (one `write()` to a non-blocking pipe), so
+    /// it's fine to invoke from a SIGWINCH handler the application
+    /// installed itself, e.g. when zigline's own handler isn't
+    /// active for some reason.
     pub fn notifyResize(self: *Editor) void {
         _ = self;
+        terminal_mod.pokeActiveSignalPipe();
     }
 
     // -------------------------------------------------------------------------
@@ -164,13 +208,18 @@ pub const Editor = struct {
 
         var spans: []const highlight_mod.HighlightSpan = &.{};
         if (self.options.highlight) |hh| {
-            const got = hh.highlight(self.allocator, self.buffer.slice()) catch null;
-            if (got) |g| {
+            if (hh.highlight(self.allocator, self.buffer.slice())) |g| {
                 span_buf = g;
                 spans = g;
+            } else |err| {
+                self.diag(.{ .kind = .highlight_hook_failed, .err = err });
             }
         }
         try self.renderer.render(&self.terminal, prompt, &self.buffer, spans);
+    }
+
+    fn diag(self: *Editor, d: Diagnostic) void {
+        if (self.options.diagnostic) |dh| dh.report(d);
     }
 
     fn handleKey(
@@ -232,7 +281,11 @@ pub const Editor = struct {
                 try self.renderer.finalize(&self.terminal);
                 const out = try self.buffer.take();
                 if (self.options.history) |h| {
-                    if (out.len > 0) h.append(out) catch {};
+                    if (out.len > 0) {
+                        h.append(out) catch |err| {
+                            self.diag(.{ .kind = .history_append_failed, .err = err });
+                        };
+                    }
                 }
                 return ReadLineResult{ .line = out };
             },
@@ -260,6 +313,19 @@ pub const Editor = struct {
             // the prior block gets cleared row-by-row and rewritten.
             // Don't markFresh here: we want the climb-and-clear.
             .redraw => {},
+            .suspend_self => {
+                // Move past the rendered block so the user lands at
+                // a fresh row in their shell, then raise SIGTSTP.
+                // The signal handler restores termios, re-raises
+                // with default disposition (process actually stops),
+                // and on resume re-enters raw mode + writes to the
+                // self-pipe. The next reader.next() picks up the
+                // pipe wake and returns .resize, which triggers a
+                // render — visually identical to a SIGWINCH.
+                try self.renderer.finalize(&self.terminal);
+                self.renderer.markFresh();
+                _ = std.c.raise(.TSTP);
+            },
         }
         return null;
     }
@@ -284,7 +350,10 @@ pub const Editor = struct {
         const result = hook.complete(self.allocator, .{
             .buffer = self.buffer.slice(),
             .cursor_byte = self.buffer.cursor_byte,
-        }) catch return;
+        }) catch |err| {
+            self.diag(.{ .kind = .completion_hook_failed, .err = err });
+            return;
+        };
         defer {
             for (result.candidates) |c| {
                 self.allocator.free(c.insert);
@@ -299,11 +368,19 @@ pub const Editor = struct {
         // mid-cluster bounds must never crash the editor or break
         // the buffer's UTF-8 / grapheme invariants.
         const buf_len = self.buffer.bytes.items.len;
-        if (result.replacement_start > result.replacement_end) return;
-        if (result.replacement_end > buf_len) return;
+        if (result.replacement_start > result.replacement_end or
+            result.replacement_end > buf_len)
+        {
+            self.diag(.{ .kind = .completion_invalid_range, .detail = "start>end or end>len" });
+            return;
+        }
         try self.buffer.ensureClusters();
-        if (!isClusterBoundary(self.buffer.clusters.items, buf_len, result.replacement_start)) return;
-        if (!isClusterBoundary(self.buffer.clusters.items, buf_len, result.replacement_end)) return;
+        if (!isClusterBoundary(self.buffer.clusters.items, buf_len, result.replacement_start) or
+            !isClusterBoundary(self.buffer.clusters.items, buf_len, result.replacement_end))
+        {
+            self.diag(.{ .kind = .completion_invalid_range, .detail = "endpoint not on cluster boundary" });
+            return;
+        }
 
         if (result.candidates.len == 0) return;
 
@@ -395,11 +472,15 @@ pub const Editor = struct {
     ) !void {
         // Reject malformed candidates before touching the buffer so
         // the caller gets either a clean replacement or no change.
-        if (!std.unicode.utf8ValidateSlice(cand.insert)) return;
+        if (!std.unicode.utf8ValidateSlice(cand.insert)) {
+            self.diag(.{ .kind = .completion_invalid_candidate, .detail = "insert is not valid UTF-8" });
+            return;
+        }
         if (cand.append) |c| {
-            // Single-byte append must be ASCII printable to keep the
-            // buffer's UTF-8 invariant; refuse otherwise.
-            if (c >= 0x80 or c < 0x20) return;
+            if (c >= 0x80 or c < 0x20) {
+                self.diag(.{ .kind = .completion_invalid_candidate, .detail = "append byte is not ASCII printable" });
+                return;
+            }
         }
 
         try self.replaceRangeAt(start, end, cand.insert);
@@ -435,7 +516,15 @@ pub const Editor = struct {
     ///   - validate the accepted line as UTF-8 (returns
     ///     `error.InvalidUtf8` if malformed)
     fn readLineCooked(self: *Editor, prompt: prompt_mod.Prompt) !ReadLineResult {
-        try self.terminal.writeAll(prompt.bytes);
+        // Only echo the prompt when stdout is a TTY. When zigline is
+        // embedded in a script that pipes its output, prompts would
+        // otherwise contaminate the machine-readable stream — and
+        // any embedded ANSI in the prompt would be ugly noise in a
+        // log file. Other libraries (readline, isocline) take the
+        // same approach.
+        if (self.terminal.isOutputTty()) {
+            try self.terminal.writeAll(prompt.bytes);
+        }
         self.buffer.clear();
         var byte: [1]u8 = undefined;
         while (true) {
@@ -613,6 +702,105 @@ test "editor: utf8TruncateToBoundary keeps complete scalars" {
     try std.testing.expectEqualStrings("hello", utf8TruncateToBoundary("hello"));
     // Empty → empty.
     try std.testing.expectEqualStrings("", utf8TruncateToBoundary(""));
+}
+
+// =============================================================================
+// Diagnostic-callback wiring test.
+// =============================================================================
+
+const DiagTestCtx = struct {
+    count: usize = 0,
+    last_kind: ?Diagnostic.Kind = null,
+
+    fn cb(ctx: *anyopaque, d: Diagnostic) void {
+        const self: *DiagTestCtx = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        self.last_kind = d.kind;
+    }
+
+    fn hook(self: *DiagTestCtx) DiagnosticHook {
+        return .{
+            .ctx = @ptrCast(self),
+            .fn_ = cb,
+        };
+    }
+};
+
+fn invertedRangeCompleter(
+    _: *anyopaque,
+    alloc: Allocator,
+    _: completion_mod.CompletionRequest,
+) anyerror!completion_mod.CompletionResult {
+    const cands = try alloc.alloc(completion_mod.Candidate, 1);
+    cands[0] = .{ .insert = try alloc.dupe(u8, "x") };
+    return .{
+        .replacement_start = 5,
+        .replacement_end = 0, // invalid: end < start
+        .candidates = cands,
+    };
+}
+
+test "editor: invalid completion range fires diagnostic, leaves buffer untouched" {
+    var diag_ctx: DiagTestCtx = .{};
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .completion = .{
+            .ctx = @ptrFromInt(0xDEAD),
+            .completeFn = invertedRangeCompleter,
+        },
+        .diagnostic = diag_ctx.hook(),
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("hello");
+    const before = try std.testing.allocator.dupe(u8, editor.buffer.slice());
+    defer std.testing.allocator.free(before);
+
+    try editor.handleComplete(prompt_mod.Prompt.plain("$ "));
+
+    try std.testing.expect(diag_ctx.count >= 1);
+    try std.testing.expectEqual(
+        @as(?Diagnostic.Kind, .completion_invalid_range),
+        diag_ctx.last_kind,
+    );
+    try std.testing.expectEqualStrings(before, editor.buffer.slice());
+}
+
+fn invalidUtf8Completer(
+    _: *anyopaque,
+    alloc: Allocator,
+    _: completion_mod.CompletionRequest,
+) anyerror!completion_mod.CompletionResult {
+    const cands = try alloc.alloc(completion_mod.Candidate, 1);
+    cands[0] = .{ .insert = try alloc.dupe(u8, "\xFF\xFE") };
+    return .{
+        .replacement_start = 0,
+        .replacement_end = 0,
+        .candidates = cands,
+    };
+}
+
+test "editor: invalid candidate UTF-8 fires diagnostic, leaves buffer untouched" {
+    var diag_ctx: DiagTestCtx = .{};
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .completion = .{
+            .ctx = @ptrFromInt(0xDEAD),
+            .completeFn = invalidUtf8Completer,
+        },
+        .diagnostic = diag_ctx.hook(),
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("hi");
+    try editor.handleComplete(prompt_mod.Prompt.plain("$ "));
+
+    try std.testing.expect(diag_ctx.count >= 1);
+    try std.testing.expectEqual(
+        @as(?Diagnostic.Kind, .completion_invalid_candidate),
+        diag_ctx.last_kind,
+    );
+    try std.testing.expectEqualStrings("hi", editor.buffer.slice());
 }
 
 test "editor: isClusterBoundary catches mid-cluster offsets" {

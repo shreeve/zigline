@@ -60,6 +60,7 @@ fn charLookup(c: u21, mods: input.Modifiers) ?Action {
             'p' => .history_prev,
             'u' => .kill_to_start,
             'w' => .kill_word_backward,
+            'z' => .suspend_self,
             else => null,
         };
     }
