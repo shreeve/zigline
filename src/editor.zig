@@ -258,9 +258,6 @@ pub const Editor = struct {
     };
 
     fn dispatchKill(self: *Editor, kind: KillKind) !void {
-        // Capture cursor position for the undo record before the
-        // kill mutates state; for backward kills the deletion idx
-        // is `cursor - len`, for forward kills it's `cursor`.
         const cursor_before = self.buffer.cursor_byte;
         const killed_opt: ?[]u8 = switch (kind) {
             .kill_to_start => try self.buffer.killToStart(),
@@ -275,7 +272,7 @@ pub const Editor = struct {
             .kill_to_start, .kill_word_backward => cursor_before - killed.len,
             .kill_to_end, .kill_word_forward => cursor_before,
         };
-        try self.changeset.recordDelete(undo_idx, killed);
+        self.recordDeleteOrDiag(undo_idx, killed, cursor_before, self.buffer.cursor_byte);
 
         const mode: kill_ring_mod.Mode = switch (kind) {
             .kill_to_start, .kill_word_backward => .prepend,
@@ -288,9 +285,15 @@ pub const Editor = struct {
 
     fn handleYank(self: *Editor) !void {
         const text = self.kill_ring.yank() orelse return;
-        self.last_yank_start = self.buffer.cursor_byte;
-        try self.changeset.recordInsert(self.buffer.cursor_byte, text);
+        const cursor_before = self.buffer.cursor_byte;
+        self.last_yank_start = cursor_before;
+        // Yank is a compound action — break the coalescing chain so
+        // typing immediately before or after it stays in its own
+        // undo step.
+        self.changeset.breakSequence();
         try self.buffer.insertText(text);
+        self.recordInsertOrDiag(cursor_before, text, cursor_before, self.buffer.cursor_byte);
+        self.changeset.breakSequence();
     }
 
     fn handleYankPop(self: *Editor) !void {
@@ -298,66 +301,114 @@ pub const Editor = struct {
         const start = self.last_yank_start;
         const end = start + pop.prev_len;
         if (end > self.buffer.bytes.items.len) return;
-        // Record the yank-pop as a delete-then-insert pair so undo
-        // unwinds it cleanly.
         const old = try self.allocator.dupe(u8, self.buffer.bytes.items[start..end]);
         defer self.allocator.free(old);
-        try self.changeset.recordDelete(start, old);
-        try self.changeset.recordInsert(start, pop.text);
+        const cursor_before = self.buffer.cursor_byte;
         try self.replaceRangeAt(start, end, pop.text);
+        // Single Replace op so one Ctrl-_ undoes the whole yank-pop.
+        self.recordReplaceOrDiag(start, old, pop.text, cursor_before, self.buffer.cursor_byte);
         self.last_yank_start = start;
     }
 
     fn handleUndo(self: *Editor) !void {
-        const op = self.changeset.popUndo() orelse return;
+        const op_ptr = self.changeset.peekUndo() orelse return;
+        // Apply on a stack-local copy of the op fields so the borrow
+        // stays valid even if `replaceRangeAt` would (somehow)
+        // observe stack state.
+        const op = op_ptr.*;
         switch (op) {
             .insert => |e| {
-                // Undo an insert by deleting the same range.
-                const end = e.idx + e.text.len;
-                if (end > self.buffer.bytes.items.len) {
-                    // Buffer drifted; abandon the op rather than
-                    // corrupt state. The op itself is freed below.
-                    self.changeset.allocator.free(e.text);
-                    return;
-                }
+                const end = std.math.add(usize, e.idx, e.text.len) catch return;
+                if (end > self.buffer.bytes.items.len) return;
                 try self.replaceRangeAt(e.idx, end, "");
-                self.buffer.cursor_byte = e.idx;
+                self.buffer.cursor_byte = e.cursor_before;
             },
             .delete => |e| {
-                // Undo a delete by re-inserting at the original idx.
-                if (e.idx > self.buffer.bytes.items.len) {
-                    self.changeset.allocator.free(e.text);
-                    return;
-                }
+                if (e.idx > self.buffer.bytes.items.len) return;
                 try self.replaceRangeAt(e.idx, e.idx, e.text);
-                self.buffer.cursor_byte = e.idx + e.text.len;
+                self.buffer.cursor_byte = e.cursor_before;
+            },
+            .replace => |e| {
+                const end = std.math.add(usize, e.idx, e.new.len) catch return;
+                if (end > self.buffer.bytes.items.len) return;
+                try self.replaceRangeAt(e.idx, end, e.old);
+                self.buffer.cursor_byte = e.cursor_before;
             },
         }
-        try self.changeset.commitUndoApplied(op);
+        // Commit on success. If the redo append OOMs, the buffer is
+        // already mutated but the op stays on undos — best-effort
+        // degradation that's strictly better than a leak.
+        self.changeset.acceptUndo() catch |err| {
+            self.diag(.{ .kind = .render_failed, .err = err, .detail = "acceptUndo failed" });
+        };
     }
 
     fn handleRedo(self: *Editor) !void {
-        const op = self.changeset.popRedo() orelse return;
+        const op_ptr = self.changeset.peekRedo() orelse return;
+        const op = op_ptr.*;
         switch (op) {
             .insert => |e| {
-                if (e.idx > self.buffer.bytes.items.len) {
-                    self.changeset.allocator.free(e.text);
-                    return;
-                }
+                if (e.idx > self.buffer.bytes.items.len) return;
                 try self.replaceRangeAt(e.idx, e.idx, e.text);
-                self.buffer.cursor_byte = e.idx + e.text.len;
+                self.buffer.cursor_byte = e.cursor_after;
             },
             .delete => |e| {
-                const end = e.idx + e.text.len;
-                if (end > self.buffer.bytes.items.len) {
-                    self.changeset.allocator.free(e.text);
-                    return;
-                }
+                const end = std.math.add(usize, e.idx, e.text.len) catch return;
+                if (end > self.buffer.bytes.items.len) return;
                 try self.replaceRangeAt(e.idx, end, "");
-                self.buffer.cursor_byte = e.idx;
+                self.buffer.cursor_byte = e.cursor_after;
+            },
+            .replace => |e| {
+                const end = std.math.add(usize, e.idx, e.old.len) catch return;
+                if (end > self.buffer.bytes.items.len) return;
+                try self.replaceRangeAt(e.idx, end, e.new);
+                self.buffer.cursor_byte = e.cursor_after;
             },
         }
-        try self.changeset.commitRedoApplied(op);
+        self.changeset.acceptRedo() catch |err| {
+            self.diag(.{ .kind = .render_failed, .err = err, .detail = "acceptRedo failed" });
+        };
+    }
+
+    /// Best-effort record helpers: if recording fails (OOM), the
+    /// edit has already happened, so we surface the failure via the
+    /// diagnostic hook and continue. The buffer state is correct;
+    /// just that one edit isn't undoable.
+    fn recordInsertOrDiag(
+        self: *Editor,
+        idx: usize,
+        text: []const u8,
+        cursor_before: usize,
+        cursor_after: usize,
+    ) void {
+        self.changeset.recordInsert(idx, text, cursor_before, cursor_after) catch |err| {
+            self.diag(.{ .kind = .render_failed, .err = err, .detail = "undo record (insert) failed" });
+        };
+    }
+
+    fn recordDeleteOrDiag(
+        self: *Editor,
+        idx: usize,
+        text: []const u8,
+        cursor_before: usize,
+        cursor_after: usize,
+    ) void {
+        self.changeset.recordDelete(idx, text, cursor_before, cursor_after) catch |err| {
+            self.diag(.{ .kind = .render_failed, .err = err, .detail = "undo record (delete) failed" });
+        };
+    }
+
+    fn recordReplaceOrDiag(
+        self: *Editor,
+        idx: usize,
+        old: []const u8,
+        new: []const u8,
+        cursor_before: usize,
+        cursor_after: usize,
+    ) void {
+        self.changeset.recordReplace(idx, old, new, cursor_before, cursor_after) catch |err| {
+            self.diag(.{ .kind = .render_failed, .err = err, .detail = "undo record (replace) failed" });
+        };
     }
 
     fn handleKey(
@@ -380,8 +431,9 @@ pub const Editor = struct {
                 },
                 .text => |t| {
                     self.kill_ring.reset();
-                    try self.changeset.recordInsert(self.buffer.cursor_byte, t);
+                    const cursor_before = self.buffer.cursor_byte;
                     try self.buffer.insertText(t);
+                    self.recordInsertOrDiag(cursor_before, t, cursor_before, self.buffer.cursor_byte);
                 },
                 else => {},
             }
@@ -425,19 +477,22 @@ pub const Editor = struct {
         }
         switch (action) {
             .insert_text => |t| {
-                try self.changeset.recordInsert(self.buffer.cursor_byte, t);
+                const cursor_before = self.buffer.cursor_byte;
                 try self.buffer.insertText(t);
+                self.recordInsertOrDiag(cursor_before, t, cursor_before, self.buffer.cursor_byte);
             },
             .delete_backward => {
+                const cursor_before = self.buffer.cursor_byte;
                 if (try self.buffer.deleteBackwardCluster()) |range| {
                     defer self.allocator.free(range.bytes);
-                    try self.changeset.recordDelete(range.idx, range.bytes);
+                    self.recordDeleteOrDiag(range.idx, range.bytes, cursor_before, self.buffer.cursor_byte);
                 }
             },
             .delete_forward => {
+                const cursor_before = self.buffer.cursor_byte;
                 if (try self.buffer.deleteForwardCluster()) |range| {
                     defer self.allocator.free(range.bytes);
-                    try self.changeset.recordDelete(range.idx, range.bytes);
+                    self.recordDeleteOrDiag(range.idx, range.bytes, cursor_before, self.buffer.cursor_byte);
                 }
             },
             .kill_to_start => try self.dispatchKill(.kill_to_start),
@@ -499,9 +554,10 @@ pub const Editor = struct {
                     try self.renderer.finalize(&self.terminal);
                     return ReadLineResult{ .eof = {} };
                 }
+                const cursor_before = self.buffer.cursor_byte;
                 if (try self.buffer.deleteForwardCluster()) |range| {
                     defer self.allocator.free(range.bytes);
-                    try self.changeset.recordDelete(range.idx, range.bytes);
+                    self.recordDeleteOrDiag(range.idx, range.bytes, cursor_before, self.buffer.cursor_byte);
                 }
             },
             .clear_screen => {
@@ -543,8 +599,9 @@ pub const Editor = struct {
     fn insertCharRecorded(self: *Editor, cp: u21) !void {
         var buf: [4]u8 = undefined;
         const len = std.unicode.utf8Encode(cp, &buf) catch return;
-        try self.changeset.recordInsert(self.buffer.cursor_byte, buf[0..len]);
+        const cursor_before = self.buffer.cursor_byte;
         try self.buffer.insertText(buf[0..len]);
+        self.recordInsertOrDiag(cursor_before, buf[0..len], cursor_before, self.buffer.cursor_byte);
     }
 
     fn handlePaste(self: *Editor, payload: []const u8) !void {
@@ -552,7 +609,16 @@ pub const Editor = struct {
         // spaces (the editor handles only single logical lines).
         const sanitized = try sanitizePaste(self.allocator, payload);
         defer self.allocator.free(sanitized);
+        if (sanitized.len == 0) return;
+        // Paste is a logical-action boundary — typing immediately
+        // before or after the paste shouldn't merge into it as a
+        // single coalesced insert.
+        self.kill_ring.reset();
+        self.changeset.breakSequence();
+        const cursor_before = self.buffer.cursor_byte;
         try self.buffer.insertText(sanitized);
+        self.recordInsertOrDiag(cursor_before, sanitized, cursor_before, self.buffer.cursor_byte);
+        self.changeset.breakSequence();
     }
 
     fn handleComplete(self: *Editor, prompt: prompt_mod.Prompt) !void {
@@ -606,8 +672,18 @@ pub const Editor = struct {
         const current = self.buffer.slice()[result.replacement_start..result.replacement_end];
 
         if (common.len > current.len and std.unicode.utf8ValidateSlice(common)) {
-            try self.recordReplaceForUndo(result.replacement_start, result.replacement_end, common);
+            const old = try self.allocator.dupe(u8, current);
+            defer self.allocator.free(old);
+            const cursor_before = self.buffer.cursor_byte;
             try self.replaceRangeAt(result.replacement_start, result.replacement_end, common);
+            self.recordReplaceOrDiag(
+                result.replacement_start,
+                old,
+                common,
+                cursor_before,
+                self.buffer.cursor_byte,
+            );
+            self.changeset.breakSequence();
         } else {
             // Move past the rendered block so the candidate list
             // doesn't print mid-prompt when the cursor is on a
@@ -695,29 +771,23 @@ pub const Editor = struct {
             }
         }
 
-        try self.recordReplaceForUndo(start, end, cand.insert);
+        const old = if (end > start)
+            try self.allocator.dupe(u8, self.buffer.bytes.items[start..end])
+        else
+            try self.allocator.dupe(u8, "");
+        defer self.allocator.free(old);
+        const cursor_before = self.buffer.cursor_byte;
         try self.replaceRangeAt(start, end, cand.insert);
         if (cand.append) |c| {
             var b: [1]u8 = .{c};
-            try self.changeset.recordInsert(self.buffer.cursor_byte, &b);
             try self.buffer.insertText(&b);
         }
-    }
-
-    /// Record `[start..end] → text` as a paired delete + insert in
-    /// the changeset, so a single undo restores the original text.
-    fn recordReplaceForUndo(
-        self: *Editor,
-        start: usize,
-        end: usize,
-        text: []const u8,
-    ) !void {
-        if (end > start) {
-            const old = try self.allocator.dupe(u8, self.buffer.bytes.items[start..end]);
-            defer self.allocator.free(old);
-            try self.changeset.recordDelete(start, old);
-        }
-        if (text.len > 0) try self.changeset.recordInsert(start, text);
+        // Whole completion (replacement + optional append) records
+        // as one Replace op, so a single Ctrl-_ unwinds it.
+        const new_text_len = cand.insert.len + @as(usize, if (cand.append != null) 1 else 0);
+        const new_text = self.buffer.bytes.items[start .. start + new_text_len];
+        self.recordReplaceOrDiag(start, old, new_text, cursor_before, self.buffer.cursor_byte);
+        self.changeset.breakSequence();
     }
 
     fn replaceRangeAt(

@@ -551,6 +551,23 @@ test "pty: Ctrl-_ undoes typed text" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "got: hi") != null);
 }
 
+test "pty: Ctrl-_ undoes M-y in a single step" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // Type "first" → Ctrl-U (kill "first") → type "second" → Ctrl-U
+    // (kill "second") → Ctrl-Y (yank "second") → M-y (cycle to
+    // "first") → Ctrl-_ (single undo restores "second", since
+    // yank-pop is now a Replace op) → Enter. Expected: "second".
+    const r = try runScript(alloc, &.{}, &.{
+        .{ .send = "first\x15second\x15\x19\x1by\x1f\n", .settle_ms = 300 },
+        .{ .send = "\x04", .settle_ms = 300 },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: second") != null);
+}
+
 test "pty: Ctrl-_ undoes a Ctrl-W kill" {
     if (!ptySupported()) return error.SkipZigTest;
 
