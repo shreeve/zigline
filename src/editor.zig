@@ -184,6 +184,17 @@ pub const CustomActionResult = union(enum) {
     cancel_line,
 };
 
+/// Snapshot of where `yank_last_arg` last inserted, used for
+/// in-place cycling on repeated invocations.
+const YankLastArgState = struct {
+    /// 0 = most-recent history entry, 1 = previous, etc.
+    cycle: usize,
+    /// Byte offset where the previous insertion started.
+    start: usize,
+    /// Length in bytes of the previous insertion.
+    len: usize,
+};
+
 pub const CustomActionHook = struct {
     ctx: *anyopaque,
     /// Called when the keymap returns `Action.custom = id`. The
@@ -267,6 +278,15 @@ pub const Editor = struct {
     /// "second half" of a CRLF that crossed the boundary between two
     /// `readLine` invocations.
     cooked_pending_lf: bool = false,
+    /// `quoted_insert` (`Ctrl-V` / `Ctrl-Q`) primes this flag; the
+    /// next key event is then inserted literally regardless of any
+    /// keymap binding it would otherwise trigger.
+    quoted_insert_pending: bool = false,
+    /// State for `yank_last_arg` (`M-.` / `M-_`) cycling. Repeated
+    /// invocations replace the most-recently-inserted token with the
+    /// previous history entry's last token. Reset by any non-yank-
+    /// last-arg action.
+    yank_last_arg: ?YankLastArgState = null,
 
     pub fn init(allocator: Allocator, options: Options) !Editor {
         return .{
@@ -514,6 +534,68 @@ pub const Editor = struct {
         };
     }
 
+    /// Apply a `Buffer.EditResult` (transpose, case-map, squeeze):
+    /// the buffer mutation already happened; record it as one
+    /// `Replace` undo step and free both byte slices. Null means
+    /// the buffer reported nothing to do.
+    fn handleEditResult(self: *Editor, result_opt: ?buffer_mod.EditResult) !void {
+        const r = result_opt orelse return;
+        defer self.allocator.free(r.old_bytes);
+        defer self.allocator.free(r.new_bytes);
+        // The dispatch loop already broke the changeset sequence
+        // for us (these aren't on the coalescing-allowed list). So
+        // the recorded Replace lands in its own undo step; one
+        // Ctrl-_ unwinds the transform.
+        const cursor_after = self.buffer.cursor_byte;
+        // The pre-edit cursor isn't tracked through the buffer's
+        // EditResult; we approximate as `r.start + r.old_bytes.len`
+        // for case ops (cursor was at start, advanced to end), and
+        // for transpose_chars the buffer also lands cursor at
+        // post-swap end. Both are correct.
+        const cursor_before = r.start + r.old_bytes.len;
+        self.recordReplaceOrDiag(r.start, r.old_bytes, r.new_bytes, cursor_before, cursor_after);
+    }
+
+    fn handleYankLastArg(self: *Editor) !void {
+        const h = self.options.history orelse return;
+        const entry_count = h.entryCount();
+        if (entry_count == 0) return;
+
+        const cycle: usize = if (self.yank_last_arg) |s| s.cycle + 1 else 0;
+        if (cycle >= entry_count) return; // cycled past the oldest
+
+        const entry = h.entryAt(entry_count - 1 - cycle).?;
+        const arg = lastWhitespaceToken(entry);
+        if (arg.len == 0) {
+            // No token in this entry — skip ahead by recording the
+            // cycle anyway so repeated M-. eventually finds one.
+            self.yank_last_arg = .{ .cycle = cycle, .start = self.buffer.cursor_byte, .len = 0 };
+            return;
+        }
+
+        if (self.yank_last_arg) |state| {
+            // Cycling: replace the previous insertion with the new
+            // last-arg in place. Recorded as one Replace op so
+            // Ctrl-_ unwinds the entire cycling sequence.
+            const old_bytes = try self.allocator.dupe(u8, self.buffer.slice()[state.start..][0..state.len]);
+            defer self.allocator.free(old_bytes);
+            const new_bytes = try self.allocator.dupe(u8, arg);
+            defer self.allocator.free(new_bytes);
+            const cursor_before = state.start + state.len;
+            try self.replaceRangeAt(state.start, state.start + state.len, arg);
+            self.recordReplaceOrDiag(state.start, old_bytes, new_bytes, cursor_before, self.buffer.cursor_byte);
+            self.yank_last_arg = .{ .cycle = cycle, .start = state.start, .len = arg.len };
+        } else {
+            // First press: insert the most recent entry's last arg.
+            const start = self.buffer.cursor_byte;
+            self.changeset.breakSequence();
+            try self.buffer.insertText(arg);
+            self.recordInsertOrDiag(start, arg, start, self.buffer.cursor_byte);
+            self.changeset.breakSequence();
+            self.yank_last_arg = .{ .cycle = 0, .start = start, .len = arg.len };
+        }
+    }
+
     fn handleCustomAction(self: *Editor, id: u32) !?ReadLineResult {
         const hook = self.options.custom_action orelse return null;
         const result = hook.invokeFn(
@@ -642,6 +724,38 @@ pub const Editor = struct {
         kev: input_mod.KeyEvent,
         prompt: prompt_mod.Prompt,
     ) !?ReadLineResult {
+        // `quoted_insert` (Ctrl-V / Ctrl-Q) was just dispatched —
+        // insert THIS event's bytes literally, bypassing the keymap
+        // and the default-insert filter. One-shot.
+        if (self.quoted_insert_pending) {
+            self.quoted_insert_pending = false;
+            self.kill_ring.reset();
+            self.changeset.breakSequence();
+            switch (kev.code) {
+                .char => |cp| {
+                    // For `Ctrl-X`-style events (kev.mods.ctrl set),
+                    // emit the C0 control byte (`\x01` for Ctrl-A,
+                    // etc.) rather than the printable letter. This
+                    // is what readline / bash do; lets users insert
+                    // literal control bytes by typing Ctrl-V Ctrl-A.
+                    var emit: u21 = cp;
+                    if (kev.mods.ctrl) {
+                        if (cp >= '@' and cp <= '_') emit = cp - '@';
+                        if (cp >= 'a' and cp <= 'z') emit = cp - 'a' + 1;
+                    }
+                    try self.insertCharRecorded(emit);
+                },
+                .text => |t| {
+                    const cursor_before = self.buffer.cursor_byte;
+                    try self.buffer.insertText(t);
+                    self.recordInsertOrDiag(cursor_before, t, cursor_before, self.buffer.cursor_byte);
+                },
+                else => {}, // arrows, function keys: discard (matches readline)
+            }
+            self.changeset.breakSequence();
+            return null;
+        }
+
         // Default-insert: printable char with no keymap binding.
         const action = self.options.keymap.lookup(kev) orelse {
             switch (kev.code) {
@@ -701,6 +815,9 @@ pub const Editor = struct {
             => {},
             else => self.changeset.breakSequence(),
         }
+        // `yank_last_arg` cycling state survives only across
+        // consecutive `yank_last_arg` invocations.
+        if (action != .yank_last_arg) self.yank_last_arg = null;
         switch (action) {
             .insert_text => |t| {
                 const cursor_before = self.buffer.cursor_byte;
@@ -751,6 +868,23 @@ pub const Editor = struct {
                     }
                 }
             },
+            .history_first => {
+                if (self.options.history) |h| {
+                    if (h.first(self.buffer.slice())) |entry| {
+                        try self.buffer.replaceAll(entry);
+                        self.changeset.clear();
+                    }
+                }
+            },
+            .history_last => {
+                if (self.options.history) |h| {
+                    if (h.last()) |entry| {
+                        try self.buffer.replaceAll(entry);
+                        self.changeset.clear();
+                    }
+                }
+            },
+            .yank_last_arg => try self.handleYankLastArg(),
             .complete => try self.handleComplete(prompt),
             .accept_line => return try self.acceptCurrentLine(),
             .cancel_line => return try self.cancelCurrentLine(),
@@ -778,6 +912,12 @@ pub const Editor = struct {
             .yank_pop => try self.handleYankPop(),
             .undo => try self.handleUndo(),
             .redo => try self.handleRedo(),
+            .transpose_chars => try self.handleEditResult(try self.buffer.transposeChars()),
+            .capitalize_word => try self.handleEditResult(try self.buffer.editWord(.capitalize)),
+            .upper_case_word => try self.handleEditResult(try self.buffer.editWord(.upper)),
+            .lower_case_word => try self.handleEditResult(try self.buffer.editWord(.lower)),
+            .squeeze_whitespace => try self.handleEditResult(try self.buffer.squeezeWhitespace()),
+            .quoted_insert => self.quoted_insert_pending = true,
             .suspend_self => {
                 // Move past the rendered block so the user lands at
                 // a fresh row in their shell, then raise SIGTSTP.
@@ -1097,6 +1237,22 @@ fn longestCommonPrefix(cands: []completion_mod.Candidate) []const u8 {
 /// True iff `byte_off` is a valid grapheme cluster boundary in the
 /// buffer of length `buf_len` whose clusters are `clusters`. The end-
 /// of-buffer offset is always a boundary; the start is too.
+/// Scan from end of `entry` backwards through ASCII whitespace,
+/// then through non-whitespace, returning the trailing token. The
+/// matching set is `[' ', '\t', '\n']`. Empty result means the
+/// entire entry is whitespace.
+fn lastWhitespaceToken(entry: []const u8) []const u8 {
+    var end = entry.len;
+    while (end > 0 and isAsciiWs(entry[end - 1])) end -= 1;
+    var start = end;
+    while (start > 0 and !isAsciiWs(entry[start - 1])) start -= 1;
+    return entry[start..end];
+}
+
+fn isAsciiWs(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n';
+}
+
 fn isClusterBoundary(
     clusters: []const buffer_mod.Cluster,
     buf_len: usize,
@@ -1481,6 +1637,137 @@ test "editor: withCookedMode propagates func errors" {
     try std.testing.expect(wcm.invoked);
 }
 
+
+test "editor: lastWhitespaceToken pulls trailing token" {
+    try std.testing.expectEqualStrings("baz", lastWhitespaceToken("foo bar baz"));
+    try std.testing.expectEqualStrings("baz", lastWhitespaceToken("foo bar baz   "));
+    try std.testing.expectEqualStrings("solo", lastWhitespaceToken("solo"));
+    try std.testing.expectEqualStrings("", lastWhitespaceToken(""));
+    try std.testing.expectEqualStrings("", lastWhitespaceToken("   "));
+    try std.testing.expectEqualStrings("c", lastWhitespaceToken("a\tb c"));
+}
+
+test "editor: dispatch transpose_chars records one Replace undo step" {
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled });
+    defer editor.deinit();
+    try editor.buffer.insertText("abcd");
+    editor.buffer.cursor_byte = 2;
+    _ = try editor.dispatch(.transpose_chars, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("acbd", editor.buffer.slice());
+    try std.testing.expect(editor.changeset.canUndo());
+    const op = editor.changeset.peekUndo().?;
+    try std.testing.expect(op.* == .replace);
+}
+
+test "editor: dispatch upper_case_word records undo + advances cursor" {
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled });
+    defer editor.deinit();
+    try editor.buffer.insertText("hello world");
+    editor.buffer.cursor_byte = 0;
+    _ = try editor.dispatch(.upper_case_word, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("HELLO world", editor.buffer.slice());
+    try std.testing.expectEqual(@as(usize, 5), editor.buffer.cursor_byte);
+    try std.testing.expect(editor.changeset.canUndo());
+}
+
+test "editor: dispatch capitalize_word + undo round-trips" {
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled });
+    defer editor.deinit();
+    try editor.buffer.insertText("hello");
+    editor.buffer.cursor_byte = 0;
+    _ = try editor.dispatch(.capitalize_word, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("Hello", editor.buffer.slice());
+    try editor.handleUndo();
+    try std.testing.expectEqualStrings("hello", editor.buffer.slice());
+}
+
+test "editor: dispatch squeeze_whitespace deletes adjacent run" {
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled });
+    defer editor.deinit();
+    try editor.buffer.insertText("foo   bar");
+    editor.buffer.cursor_byte = 5;
+    _ = try editor.dispatch(.squeeze_whitespace, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("foobar", editor.buffer.slice());
+}
+
+test "editor: quoted_insert primes flag, next key emits literal control byte" {
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled });
+    defer editor.deinit();
+    // First dispatch primes the flag.
+    _ = try editor.dispatch(.quoted_insert, prompt_mod.Prompt.plain(""));
+    try std.testing.expect(editor.quoted_insert_pending);
+    // Next key event: Ctrl-A, which should insert byte 0x01 literally.
+    const ctrl_a = input_mod.KeyEvent{
+        .code = .{ .char = 'a' },
+        .mods = .{ .ctrl = true },
+    };
+    _ = try editor.handleKey(ctrl_a, prompt_mod.Prompt.plain(""));
+    try std.testing.expect(!editor.quoted_insert_pending);
+    try std.testing.expectEqualSlices(u8, "\x01", editor.buffer.slice());
+}
+
+test "editor: history_first / history_last navigate bookends" {
+    var hist = try history_mod.History.init(std.testing.allocator, .{});
+    defer hist.deinit();
+    try hist.append("oldest");
+    try hist.append("middle");
+    try hist.append("newest");
+
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled, .history = &hist });
+    defer editor.deinit();
+    try editor.buffer.insertText("draft");
+    _ = try editor.dispatch(.history_first, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("oldest", editor.buffer.slice());
+    _ = try editor.dispatch(.history_last, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("draft", editor.buffer.slice());
+}
+
+test "editor: yank_last_arg inserts last token of newest entry" {
+    var hist = try history_mod.History.init(std.testing.allocator, .{});
+    defer hist.deinit();
+    try hist.append("git commit -m hello");
+    try hist.append("ls /tmp/foo.txt");
+
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled, .history = &hist });
+    defer editor.deinit();
+    try editor.buffer.insertText("cat ");
+    _ = try editor.dispatch(.yank_last_arg, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("cat /tmp/foo.txt", editor.buffer.slice());
+}
+
+test "editor: yank_last_arg cycles through entries on repeat" {
+    var hist = try history_mod.History.init(std.testing.allocator, .{});
+    defer hist.deinit();
+    try hist.append("git commit -m hello");
+    try hist.append("ls /tmp/foo.txt");
+
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled, .history = &hist });
+    defer editor.deinit();
+    try editor.buffer.insertText("cat ");
+    _ = try editor.dispatch(.yank_last_arg, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("cat /tmp/foo.txt", editor.buffer.slice());
+    // Second M-. cycles back to the previous entry.
+    _ = try editor.dispatch(.yank_last_arg, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("cat hello", editor.buffer.slice());
+}
+
+test "editor: yank_last_arg state resets on non-yank action" {
+    var hist = try history_mod.History.init(std.testing.allocator, .{});
+    defer hist.deinit();
+    try hist.append("foo bar");
+    try hist.append("baz qux");
+
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled, .history = &hist });
+    defer editor.deinit();
+    _ = try editor.dispatch(.yank_last_arg, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("qux", editor.buffer.slice());
+    // Cursor move resets cycling.
+    _ = try editor.dispatch(.move_to_start, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqual(@as(?YankLastArgState, null), editor.yank_last_arg);
+    // Now yank_last_arg starts fresh — pulls newest entry's last arg again.
+    _ = try editor.dispatch(.yank_last_arg, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("quxqux", editor.buffer.slice());
+}
 
 test "editor: isClusterBoundary catches mid-cluster offsets" {
     // "café" at byte 4 is mid-é (cluster spans [3, 5)).

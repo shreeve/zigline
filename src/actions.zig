@@ -29,6 +29,12 @@ pub const Action = union(enum) {
     // History.
     history_prev,
     history_next,
+    history_first,
+    history_last,
+    /// Insert the last whitespace-separated token of the most-
+    /// recently-accepted history entry at the cursor. Repeated
+    /// invocations cycle back through earlier entries.
+    yank_last_arg,
 
     // Completion.
     complete,
@@ -57,6 +63,27 @@ pub const Action = union(enum) {
     // `accept_line` clears the history so undo never crosses lines.
     undo,
     redo,
+
+    // In-place text transforms — emacs-style buffer ops with no
+    // kill-ring interaction. Each is one undo step.
+    /// Swap the cluster ending at the cursor with the cluster
+    /// starting at the cursor. At end-of-buffer, swap the last two.
+    transpose_chars,
+    /// Uppercase the first ASCII letter of the word at/after cursor;
+    /// lowercase the rest. Cursor lands past the word.
+    capitalize_word,
+    /// Uppercase every ASCII letter in the word at/after cursor.
+    upper_case_word,
+    /// Lowercase every ASCII letter in the word at/after cursor.
+    lower_case_word,
+    /// Delete every horizontal-whitespace byte adjacent to the
+    /// cursor (matches emacs `delete-horizontal-space`).
+    squeeze_whitespace,
+
+    /// Insert the next received byte literally, bypassing the
+    /// keymap. Useful for typing actual control bytes (`Ctrl-V Ctrl-A`
+    /// inserts `\x01`). One key event of "raw" mode.
+    quoted_insert,
 
     // Application-defined extension. The keymap returns
     // `.custom = id` for app-specific keystrokes; the editor invokes

@@ -87,8 +87,8 @@ pub const History = struct {
                 .none => {},
                 .adjacent => {
                     if (self.entries.items.len > 0) {
-                        const last = self.entries.items[self.entries.items.len - 1];
-                        if (std.mem.eql(u8, last, line)) continue;
+                        const tail = self.entries.items[self.entries.items.len - 1];
+                        if (std.mem.eql(u8, tail, line)) continue;
                     }
                 },
                 .all => {
@@ -117,8 +117,8 @@ pub const History = struct {
             .none => {},
             .adjacent => {
                 if (self.entries.items.len > 0) {
-                    const last = self.entries.items[self.entries.items.len - 1];
-                    if (std.mem.eql(u8, last, line)) return; // skip both in-mem and persist
+                    const tail = self.entries.items[self.entries.items.len - 1];
+                    if (std.mem.eql(u8, tail, line)) return; // skip both in-mem and persist
                 }
             },
             .all => {
@@ -169,6 +169,51 @@ pub const History = struct {
         self.cursor = null;
         if (self.snapshot) |s| return s;
         return "";
+    }
+
+    /// Jump to the oldest entry (`M-<` / `beginning-of-history`).
+    /// Snapshots the live buffer if not already cursoring. Returns
+    /// the oldest entry's text, or null if history is empty.
+    pub fn first(self: *History, current: []const u8) ?[]const u8 {
+        if (self.entries.items.len == 0) return null;
+        if (self.cursor == null) {
+            if (self.snapshot) |s| self.allocator.free(s);
+            self.snapshot = self.allocator.dupe(u8, current) catch null;
+        }
+        self.cursor = 0;
+        return self.entries.items[0];
+    }
+
+    /// Jump back to the live buffer (`M->` / `end-of-history`),
+    /// past the most recent entry. Returns the saved snapshot, or
+    /// the empty string if no snapshot was taken (no history
+    /// navigation happened first).
+    pub fn last(self: *History) ?[]const u8 {
+        self.cursor = null;
+        if (self.snapshot) |s| return s;
+        return "";
+    }
+
+    /// Read-only peek at the most-recently-appended entry without
+    /// touching the cursor or snapshot. Used by `yank_last_arg` to
+    /// pull the last whitespace-separated token from the previous
+    /// command. Returns null on empty history.
+    pub fn lastEntry(self: *const History) ?[]const u8 {
+        if (self.entries.items.len == 0) return null;
+        return self.entries.items[self.entries.items.len - 1];
+    }
+
+    /// Read-only peek at an arbitrary entry by index, with `0` being
+    /// the oldest. Returns null if out of range. Used by `yank_last_arg`
+    /// cycling to walk back through prior entries.
+    pub fn entryAt(self: *const History, idx: usize) ?[]const u8 {
+        if (idx >= self.entries.items.len) return null;
+        return self.entries.items[idx];
+    }
+
+    /// Number of stored entries (in-memory; persistence is separate).
+    pub fn entryCount(self: *const History) usize {
+        return self.entries.items.len;
     }
 
     pub fn resetCursor(self: *History) void {
@@ -283,6 +328,53 @@ test "history: append + navigate" {
     try std.testing.expectEqualStrings("second", h.next().?);
     // past-the-end returns the snapshot
     try std.testing.expectEqualStrings("", h.next().?);
+}
+
+test "history: first jumps to oldest entry" {
+    var h = try History.init(std.testing.allocator, .{});
+    defer h.deinit();
+
+    try h.append("a");
+    try h.append("b");
+    try h.append("c");
+
+    try std.testing.expectEqualStrings("a", h.first("draft").?);
+    // After first(), next() walks forward.
+    try std.testing.expectEqualStrings("b", h.next().?);
+    try std.testing.expectEqualStrings("c", h.next().?);
+}
+
+test "history: last restores live snapshot" {
+    var h = try History.init(std.testing.allocator, .{});
+    defer h.deinit();
+
+    try h.append("a");
+    try h.append("b");
+    // Walk to oldest first to set up a snapshot.
+    _ = h.first("my draft").?;
+    // Now jump back.
+    try std.testing.expectEqualStrings("my draft", h.last().?);
+}
+
+test "history: first on empty history returns null" {
+    var h = try History.init(std.testing.allocator, .{});
+    defer h.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), h.first(""));
+}
+
+test "history: lastEntry / entryAt / entryCount peek without moving cursor" {
+    var h = try History.init(std.testing.allocator, .{});
+    defer h.deinit();
+
+    try h.append("foo");
+    try h.append("bar baz");
+
+    try std.testing.expectEqual(@as(usize, 2), h.entryCount());
+    try std.testing.expectEqualStrings("bar baz", h.lastEntry().?);
+    try std.testing.expectEqualStrings("foo", h.entryAt(0).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), h.entryAt(2));
+    // Cursor untouched: previous still walks from newest.
+    try std.testing.expectEqualStrings("bar baz", h.previous("").?);
 }
 
 test "history: dedup adjacent skips repeat" {

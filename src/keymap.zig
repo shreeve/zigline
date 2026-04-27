@@ -58,7 +58,10 @@ fn charLookup(c: u21, mods: input.Modifiers) ?Action {
             'l' => .clear_screen,
             'n' => .history_next,
             'p' => .history_prev,
+            'q' => .quoted_insert,
+            't' => .transpose_chars,
             'u' => .kill_to_start,
+            'v' => .quoted_insert,
             'w' => .kill_word_backward,
             'y' => .yank,
             'z' => .suspend_self,
@@ -71,9 +74,21 @@ fn charLookup(c: u21, mods: input.Modifiers) ?Action {
     if (mods.alt) {
         return switch (c) {
             'b' => .move_word_left,
-            'f' => .move_word_right,
+            'c' => .capitalize_word,
             'd' => .kill_word_forward,
+            'f' => .move_word_right,
+            'l' => .lower_case_word,
+            'u' => .upper_case_word,
             'y' => .yank_pop,
+            '<' => .history_first,
+            '>' => .history_last,
+            // M-. and M-_ are both bound to yank-last-arg in
+            // readline / bash. Bash users hit M-. instinctively;
+            // M-_ is the shifted alternative on layouts where M-.
+            // is hard to reach.
+            '.' => .yank_last_arg,
+            '_' => .yank_last_arg,
+            '\\' => .squeeze_whitespace,
             else => null,
         };
     }

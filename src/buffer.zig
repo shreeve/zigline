@@ -24,6 +24,27 @@ pub const DeletedRange = struct {
     bytes: []u8,
 };
 
+/// Result of an in-place range edit (transpose, case-map, squeeze).
+/// `start` is the byte offset of the modified region; `old_bytes` is
+/// what was there before, `new_bytes` is what's there now. Both
+/// slices are allocator-owned — the caller frees both. Pairs with
+/// `Changeset.recordReplace` directly.
+pub const EditResult = struct {
+    start: usize,
+    old_bytes: []u8,
+    new_bytes: []u8,
+};
+
+/// Word case-mapping selector for `Buffer.editWord`.
+pub const WordCase = enum {
+    /// Uppercase the first ASCII letter; lowercase the rest.
+    capitalize,
+    /// Uppercase every ASCII letter in the word.
+    upper,
+    /// Lowercase every ASCII letter in the word.
+    lower,
+};
+
 pub const Buffer = struct {
     allocator: Allocator,
     bytes: std.ArrayListUnmanaged(u8) = .empty,
@@ -217,6 +238,121 @@ pub const Buffer = struct {
         return killed;
     }
 
+    /// Swap the cluster ending at the cursor with the cluster starting
+    /// at the cursor. If the cursor is at end-of-buffer, swap the
+    /// last two clusters instead (emacs convention). Cursor lands
+    /// past the swapped pair so repeated invocations scroll a
+    /// cluster rightward through the buffer.
+    ///
+    /// Returns null when there's nothing to swap (fewer than 2
+    /// clusters, or cursor sits before the first cluster).
+    pub fn transposeChars(self: *Buffer) !?EditResult {
+        try self.ensureClusters();
+        const n = self.clusters.items.len;
+        if (n < 2) return null;
+        var idx = self.clusterIndexAt(self.cursor_byte) orelse return null;
+        if (idx == n) {
+            // At end — swap the last two clusters; cursor stays at end.
+            idx = n - 1;
+        } else if (idx == 0) {
+            return null;
+        }
+
+        const a = self.clusters.items[idx - 1];
+        const b = self.clusters.items[idx];
+        const start = a.byte_start;
+        const end = b.byte_end;
+        const a_len = a.byte_end - a.byte_start;
+        const b_len = b.byte_end - b.byte_start;
+
+        const old_bytes = try self.allocator.dupe(u8, self.bytes.items[start..end]);
+        errdefer self.allocator.free(old_bytes);
+        const new_bytes = try self.allocator.alloc(u8, a_len + b_len);
+        errdefer self.allocator.free(new_bytes);
+
+        @memcpy(new_bytes[0..b_len], self.bytes.items[b.byte_start..b.byte_end]);
+        @memcpy(new_bytes[b_len..], self.bytes.items[a.byte_start..a.byte_end]);
+        @memcpy(self.bytes.items[start..end], new_bytes);
+
+        self.cursor_byte = end;
+        self.clusters_valid = false;
+        return .{ .start = start, .old_bytes = old_bytes, .new_bytes = new_bytes };
+    }
+
+    /// Apply a case transform to the word at/after the cursor. If
+    /// the cursor is in whitespace, skips forward to the next word
+    /// first. Cursor lands past the modified word (emacs convention).
+    /// Returns null when there's no word at/after the cursor.
+    ///
+    /// ASCII-only: non-ASCII bytes pass through unchanged. Full
+    /// Unicode case folding is post-v1.0 work.
+    pub fn editWord(self: *Buffer, op: WordCase) !?EditResult {
+        const len = self.bytes.items.len;
+        var b = self.cursor_byte;
+        while (b < len and isWordSep(self.bytes.items[b])) b += 1;
+        if (b >= len) return null;
+        const start = b;
+        while (b < len and !isWordSep(self.bytes.items[b])) b += 1;
+        const end = b;
+
+        const old_bytes = try self.allocator.dupe(u8, self.bytes.items[start..end]);
+        errdefer self.allocator.free(old_bytes);
+        const new_bytes = try self.allocator.dupe(u8, self.bytes.items[start..end]);
+        errdefer self.allocator.free(new_bytes);
+
+        switch (op) {
+            .capitalize => {
+                if (new_bytes.len > 0) new_bytes[0] = std.ascii.toUpper(new_bytes[0]);
+                for (new_bytes[1..]) |*c| c.* = std.ascii.toLower(c.*);
+            },
+            .upper => for (new_bytes) |*c| {
+                c.* = std.ascii.toUpper(c.*);
+            },
+            .lower => for (new_bytes) |*c| {
+                c.* = std.ascii.toLower(c.*);
+            },
+        }
+
+        // No-op short-circuit: if nothing changed, return null. Saves
+        // an undo entry for actions like "uppercase NUMBERS".
+        if (std.mem.eql(u8, old_bytes, new_bytes)) {
+            self.allocator.free(old_bytes);
+            self.allocator.free(new_bytes);
+            self.cursor_byte = end;
+            return null;
+        }
+
+        @memcpy(self.bytes.items[start..end], new_bytes);
+        self.cursor_byte = end;
+        self.clusters_valid = false;
+        return .{ .start = start, .old_bytes = old_bytes, .new_bytes = new_bytes };
+    }
+
+    /// Delete all whitespace bytes adjacent to the cursor. Matches
+    /// emacs `delete-horizontal-space` (`M-\`): collapses a run of
+    /// whitespace to zero, not to one. Cursor lands at the start of
+    /// the deleted run. Returns null when there's no whitespace
+    /// adjacent.
+    pub fn squeezeWhitespace(self: *Buffer) !?EditResult {
+        const len = self.bytes.items.len;
+        var s = self.cursor_byte;
+        while (s > 0 and isAsciiHSpace(self.bytes.items[s - 1])) s -= 1;
+        var e = self.cursor_byte;
+        while (e < len and isAsciiHSpace(self.bytes.items[e])) e += 1;
+        if (s == e) return null;
+
+        const old_bytes = try self.allocator.dupe(u8, self.bytes.items[s..e]);
+        errdefer self.allocator.free(old_bytes);
+        const new_bytes = try self.allocator.alloc(u8, 0);
+        errdefer self.allocator.free(new_bytes);
+
+        std.mem.copyForwards(u8, self.bytes.items[s..], self.bytes.items[e..]);
+        self.bytes.shrinkRetainingCapacity(len - (e - s));
+        self.cursor_byte = s;
+        self.clusters_valid = false;
+        return .{ .start = s, .old_bytes = old_bytes, .new_bytes = new_bytes };
+    }
+
     /// Replace the entire buffer with `text`. Cursor moves to end.
     pub fn replaceAll(self: *Buffer, text: []const u8) !void {
         if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
@@ -255,6 +391,13 @@ pub const Buffer = struct {
 
 fn isWordSep(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '/' or c == ':';
+}
+
+/// Horizontal whitespace only — what `M-\` (squeeze) targets.
+/// Distinct from `isWordSep` because newlines and word-internal
+/// separators like `/` and `:` shouldn't be squeezed.
+fn isAsciiHSpace(c: u8) bool {
+    return c == ' ' or c == '\t';
 }
 
 // =============================================================================
@@ -372,4 +515,172 @@ test "buffer: killToStart at byte 0 returns null" {
     try b.insertText("hi");
     b.cursor_byte = 0;
     try std.testing.expectEqual(@as(?[]u8, null), try b.killToStart());
+}
+
+fn freeEditResult(alloc: Allocator, r: ?EditResult) void {
+    const x = r orelse return;
+    alloc.free(x.old_bytes);
+    alloc.free(x.new_bytes);
+}
+
+test "buffer: transposeChars swaps mid-buffer + advances cursor" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("abcd");
+    b.cursor_byte = 2; // between b and c
+    const r = try b.transposeChars();
+    defer freeEditResult(std.testing.allocator, r);
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualStrings("acbd", b.slice());
+    try std.testing.expectEqual(@as(usize, 3), b.cursor_byte);
+}
+
+test "buffer: transposeChars at end-of-buffer swaps last two" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("abcd");
+    // cursor is at end (byte 4) by default after insert
+    const r = try b.transposeChars();
+    defer freeEditResult(std.testing.allocator, r);
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualStrings("abdc", b.slice());
+    try std.testing.expectEqual(@as(usize, 4), b.cursor_byte);
+}
+
+test "buffer: transposeChars at start is no-op" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("abcd");
+    b.cursor_byte = 0;
+    const r = try b.transposeChars();
+    try std.testing.expectEqual(@as(?EditResult, null), r);
+    try std.testing.expectEqualStrings("abcd", b.slice());
+}
+
+test "buffer: transposeChars on single-char buffer is no-op" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("a");
+    const r = try b.transposeChars();
+    try std.testing.expectEqual(@as(?EditResult, null), r);
+}
+
+test "buffer: transposeChars across grapheme clusters" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    // "café" — the 'é' is a 2-byte cluster (U+00E9)
+    try b.insertText("café");
+    // Cursor at end. Swap 'f' and 'é'.
+    const r = try b.transposeChars();
+    defer freeEditResult(std.testing.allocator, r);
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualStrings("caéf", b.slice());
+}
+
+test "buffer: editWord capitalize on lowercase word" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("hello world");
+    b.cursor_byte = 0;
+    const r = try b.editWord(.capitalize);
+    defer freeEditResult(std.testing.allocator, r);
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualStrings("Hello world", b.slice());
+    try std.testing.expectEqual(@as(usize, 5), b.cursor_byte);
+}
+
+test "buffer: editWord upper on mixed case" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("Hello world");
+    b.cursor_byte = 6;
+    const r = try b.editWord(.upper);
+    defer freeEditResult(std.testing.allocator, r);
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualStrings("Hello WORLD", b.slice());
+    try std.testing.expectEqual(@as(usize, 11), b.cursor_byte);
+}
+
+test "buffer: editWord lower on uppercase" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("HELLO");
+    b.cursor_byte = 0;
+    const r = try b.editWord(.lower);
+    defer freeEditResult(std.testing.allocator, r);
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualStrings("hello", b.slice());
+}
+
+test "buffer: editWord skips leading whitespace" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("   word");
+    b.cursor_byte = 0;
+    const r = try b.editWord(.upper);
+    defer freeEditResult(std.testing.allocator, r);
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualStrings("   WORD", b.slice());
+}
+
+test "buffer: editWord no-op on numbers" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("12345");
+    b.cursor_byte = 0;
+    const r = try b.editWord(.upper);
+    try std.testing.expectEqual(@as(?EditResult, null), r);
+    try std.testing.expectEqualStrings("12345", b.slice());
+    try std.testing.expectEqual(@as(usize, 5), b.cursor_byte);
+}
+
+test "buffer: editWord at end-of-buffer returns null" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("hi   ");
+    // cursor at end, only whitespace left
+    const r = try b.editWord(.upper);
+    try std.testing.expectEqual(@as(?EditResult, null), r);
+}
+
+test "buffer: squeezeWhitespace deletes run around cursor" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("foo   bar");
+    b.cursor_byte = 4; // inside the spaces
+    const r = try b.squeezeWhitespace();
+    defer freeEditResult(std.testing.allocator, r);
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualStrings("foobar", b.slice());
+    try std.testing.expectEqual(@as(usize, 3), b.cursor_byte);
+}
+
+test "buffer: squeezeWhitespace at non-whitespace returns null" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("foo");
+    b.cursor_byte = 1;
+    const r = try b.squeezeWhitespace();
+    try std.testing.expectEqual(@as(?EditResult, null), r);
+}
+
+test "buffer: squeezeWhitespace handles tabs + spaces" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("a \t \tb");
+    b.cursor_byte = 3;
+    const r = try b.squeezeWhitespace();
+    defer freeEditResult(std.testing.allocator, r);
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualStrings("ab", b.slice());
+}
+
+test "buffer: squeezeWhitespace preserves newlines (only horizontal ws)" {
+    var b = Buffer.init(std.testing.allocator);
+    defer b.deinit();
+    try b.insertText("a\nb");
+    b.cursor_byte = 1;
+    const r = try b.squeezeWhitespace();
+    try std.testing.expectEqual(@as(?EditResult, null), r);
+    try std.testing.expectEqualStrings("a\nb", b.slice());
 }

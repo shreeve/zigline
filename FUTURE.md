@@ -47,39 +47,21 @@ concrete bullet list.
 
 ### Quick wins — table-stakes emacs commands
 
-The following are emacs defaults shipped by readline / rustyline /
-isocline / bestline that zigline doesn't yet have. Each is a small
-`Buffer` method + a keymap entry; missing them is the difference
-between "feels like readline" and "feels like an alpha." Ship as a
-batch when convenient.
+The first batch shipped in v0.1.5 (transpose-chars, three case ops,
+quoted-insert, history bookends, yank-last-arg, squeeze whitespace).
+Two emacs editing primitives still pending here:
 
-- **Transpose chars (`Ctrl-T`).** Swap previous and current chars.
-  Reference: `rustyline/src/line_buffer.rs::transpose_chars`.
 - **Transpose words (`M-t`).** Swap previous and current words.
-  Reference: `rustyline/src/line_buffer.rs::transpose_words`.
-- **Word case ops (`M-c` capitalize, `M-u` upper, `M-l` lower).**
-  Operate on the word at/after cursor, advancing cursor past it.
-  Reference: `rustyline/src/line_buffer.rs::edit_word(WordAction::*)`.
-- **Quoted insert (`Ctrl-V` / `Ctrl-Q`).** Read next byte literally,
-  bypassing the keymap, and insert it. Useful for inserting actual
-  control bytes. Reference: `readline/bind.c::rl_quoted_insert`.
-- **History first/last (`M-<` / `M->`).** Jump to oldest / newest
-  history entry. Reference: `readline/funmap.c` mappings.
-- **Yank last arg (`M-.` / `M-_`).** Insert the last whitespace-
-  separated token from the previous history line. Bash users hit
-  this constantly when editing argv across commands. Repeated
-  `M-.` cycles back through earlier lines' last args. Reference:
-  `readline/bind.c::rl_yank_last_arg`,
-  `replxx::ReplxxAction::REPLXX_ACTION_YANK_LAST_ARG`.
-- **Squeeze adjacent whitespace (`M-\`).** Collapse runs of
-  whitespace around the cursor down to a single space. Small,
-  occasionally useful when fixing pasted-in commands.
-  Reference: `bestline.c` (search for "squeeze").
+  Word-boundary logic is fiddlier than transpose-chars — needs
+  proper "where am I in the word lattice?" handling. Reference:
+  `rustyline/src/line_buffer.rs::transpose_words`,
+  `bestline.c::bestlineEditTransposeWords`.
 - **Mark and point (`Ctrl-Space` set mark, `Ctrl-X Ctrl-X` swap).**
-  Set a position, jump back to it, swap cursor with mark. Standard
-  emacs editing primitive that pairs well with kill-region. ~30
-  lines: one stored cursor position on `Editor`, two action
-  variants. Reference: `bestline.c` (search for "mark").
+  Set a position, jump back to it, swap cursor with mark. The
+  editor-state piece is small (one optional cursor field, two
+  action variants); the binding is the blocker — `Ctrl-X Ctrl-X`
+  is a multi-key chord, which needs the binding-table API
+  (v1.0 blocker). Reference: `bestline.c` (search for "mark").
 
 ### Bigger features
 
