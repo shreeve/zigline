@@ -586,7 +586,9 @@ storage shape.
 **Mutability.** `bind`/`unbind` are mutators. Apps may rebind
 between `readLine` calls. The dispatcher reads the table during a
 `readLine`; mutating during `readLine` is undefined. Single-thread
-expectation; no locks.
+expectation; no locks. The `BindingTable` doc-comment in `keymap.zig`
+states this explicitly so future embedders don't accidentally
+violate it.
 
 **Discovery.** Out of scope for v1.0. Apps that need to dump
 bindings (F1 help overlay, etc.) keep their own bookkeeping;
@@ -617,6 +619,25 @@ small per-`readLine` event buffer:
 pending_keys: std.ArrayListUnmanaged(KeyEvent) = .empty,
 ```
 
+**Precedence: bindings first, lookupFn as fallback.** When both are
+set and a binding sequence starts with the same key as a `lookupFn`
+single-key action, the binding-table wins for that prefix. The
+`lookupFn` is consulted only when:
+
+- the buffered prefix is exactly one event long AND the binding-
+  table reports `.none` (no multi-key binding starts with this
+  event), OR
+- the buffered prefix is being replayed after a `.none` mismatch
+  (the first event of the failed sequence is dispatched via
+  `lookupFn`).
+
+Practical implication: a key K cannot simultaneously trigger a
+single-key action (via `lookupFn`) AND start a multi-key sequence
+(via `bindings`). Apps with a prefix key choose one role for it.
+This matches readline / emacs / bash. (A configurable chord-
+resolve timeout would let K mean both depending on what comes
+after; that's deferred to post-v1.0 — see `FUTURE.md`.)
+
 On each `KeyEvent`:
 
 1. **Append** the event to `pending_keys`.
@@ -632,7 +653,9 @@ On each `KeyEvent`:
        resolve. Dispatch the **first** event via `lookupFn` (as a
        singleton), then **re-process** the remaining events through
        this state machine. Clear `pending_keys` only after replay
-       completes. (Matches readline's "abandoned chord" behavior.)
+       completes. (Matches readline's "abandoned chord" behavior;
+       preserves user input — a binding miss never silently drops
+       keystrokes.)
 
 **Non-key events resolve partial sequences as singletons.**
 Bracketed paste, resize, EOF, error — none of these can extend a
