@@ -22,6 +22,11 @@ concrete bullet list.
   is insufficient.
 - **Cursor visibility hide/show around repaint.** `\x1b[?25l` / `\x1b[?25h`
   to suppress cursor flicker during multi-step repaints.
+- **Right prompt (`rprompt`).** Right-aligned prompt text on the
+  prompt row (git branch, vi-mode indicator, exit status). Layout-
+  aware — must hide if buffer text would collide. Reference:
+  `reedline::prompt::Prompt::render_prompt_right`, fish/zsh
+  `RPROMPT`.
 
 ## Input
 
@@ -39,6 +44,44 @@ concrete bullet list.
   they evolve independently).
 
 ## Editor / UX
+
+### Quick wins — table-stakes emacs commands
+
+The following are emacs defaults shipped by readline / rustyline /
+isocline / bestline that zigline doesn't yet have. Each is a small
+`Buffer` method + a keymap entry; missing them is the difference
+between "feels like readline" and "feels like an alpha." Ship as a
+batch when convenient.
+
+- **Transpose chars (`Ctrl-T`).** Swap previous and current chars.
+  Reference: `rustyline/src/line_buffer.rs::transpose_chars`.
+- **Transpose words (`M-t`).** Swap previous and current words.
+  Reference: `rustyline/src/line_buffer.rs::transpose_words`.
+- **Word case ops (`M-c` capitalize, `M-u` upper, `M-l` lower).**
+  Operate on the word at/after cursor, advancing cursor past it.
+  Reference: `rustyline/src/line_buffer.rs::edit_word(WordAction::*)`.
+- **Quoted insert (`Ctrl-V` / `Ctrl-Q`).** Read next byte literally,
+  bypassing the keymap, and insert it. Useful for inserting actual
+  control bytes. Reference: `readline/bind.c::rl_quoted_insert`.
+- **History first/last (`M-<` / `M->`).** Jump to oldest / newest
+  history entry. Reference: `readline/funmap.c` mappings.
+- **Yank last arg (`M-.` / `M-_`).** Insert the last whitespace-
+  separated token from the previous history line. Bash users hit
+  this constantly when editing argv across commands. Repeated
+  `M-.` cycles back through earlier lines' last args. Reference:
+  `readline/bind.c::rl_yank_last_arg`,
+  `replxx::ReplxxAction::REPLXX_ACTION_YANK_LAST_ARG`.
+- **Squeeze adjacent whitespace (`M-\`).** Collapse runs of
+  whitespace around the cursor down to a single space. Small,
+  occasionally useful when fixing pasted-in commands.
+  Reference: `bestline.c` (search for "squeeze").
+- **Mark and point (`Ctrl-Space` set mark, `Ctrl-X Ctrl-X` swap).**
+  Set a position, jump back to it, swap cursor with mark. Standard
+  emacs editing primitive that pairs well with kill-region. ~30
+  lines: one stored cursor position on `Editor`, two action
+  variants. Reference: `bestline.c` (search for "mark").
+
+### Bigger features
 
 - **vi-mode keymap.** Modal editing with normal/insert/visual states.
   Reference: `readline/vi_mode.c` for the state machine, `rustyline/src/keymap.rs`
@@ -67,15 +110,99 @@ concrete bullet list.
   forking the keymap.
 - **Configurable word-boundary policy.** Currently word movement is
   whitespace-based; emacs uses `[A-Za-z0-9_]+`; vi has its own.
+- **Subword movement.** Cursor moves and word kills inside
+  `camelCase` and `snake_case` identifiers. `helloWorld` is two
+  subwords; `hello_world` is two subwords. Common request from
+  REPL users editing code. Reference:
+  `replxx::ReplxxAction::*_SUBWORD_*`.
+- **Sexp navigation (`Ctrl-M-F` / `Ctrl-M-B`).** Move forward/
+  backward by parenthesized expression. Useful in REPLs for
+  Lisp-flavored syntax (zigline is the line editor for slash;
+  shells with paren-sensitive constructs benefit too).
+  Reference: `bestline.c` "FORWARD EXPR" / "BACKWARD EXPR".
+- **History common-prefix search.** Type a partial command,
+  press Up — only history entries starting with that prefix
+  scroll. Fish/zsh have this; users expect it once they've used
+  it. Distinct from reverse-i-search (different UX). Reference:
+  `replxx::REPLXX_ACTION_HISTORY_COMMON_PREFIX_SEARCH`.
+- **Overwrite mode toggle (`Insert` key).** Toggle between insert
+  and overwrite modes (overwrite = each typed char replaces the
+  one under cursor). Classic editor behavior. Renderer needs a
+  flag for cursor shape (block in overwrite, bar in insert).
+  Reference: `replxx::REPLXX_ACTION_TOGGLE_OVERWRITE_MODE`.
 - **Completion-while-typing.** Filter candidates as the user types
   more characters. Requires async or at least debounced completion.
+- **Completion behavior knobs.** Once we have the multi-column
+  menu, surface the variants other libraries expose: double-tab
+  mode (Tab once = LCP, Tab twice = list), immediate-completion
+  mode (Tab = first match, no LCP step), complete-on-empty
+  (Tab on empty buffer shows all options), beep-on-ambiguous
+  (terminal bell on ambiguous Tab), pagination cutoff
+  (page after N candidates). All `Options` toggles. Reference:
+  `replxx_set_double_tab_completion`, `_immediate_completion`,
+  `_complete_on_empty`, `_beep_on_ambiguous_completion`,
+  `_completion_count_cutoff`.
+- **Hint debounce.** When hints ship, expose a "wait N ms after
+  last keystroke before invoking the hint hook" knob so quick
+  typing doesn't show stale hints. Reference:
+  `replxx_set_hint_delay`.
+- **Multi-line indent.** When buffer wraps onto a continuation
+  row, indent the wrapped portion to align under the prompt
+  width. Visual polish; small renderer change. Reference:
+  `replxx_set_indent_multiline`.
 - **Automatic history compaction.** `History.compact()` exists and
   is exposed for callers who want to invoke it periodically; consider
   invoking it automatically on `deinit` or when the file grows past a
   threshold.
+- **Mask mode for password input.** `Options.mask_input` flag (or
+  `Editor.maskMode(bool)`) that renders every grapheme as `*` while
+  the buffer holds the real bytes. Returns real bytes on accept.
+  Reference: `linenoise.c::maskmode` flag plumbed through
+  `refreshSingleLine` / `refreshMultiLine`.
+- **Buffer preload.** `Editor.preloadBuffer(text)` inserts text into
+  the next `readLine`'s buffer before the input loop starts. Useful
+  for "edit this previous command" / "fill in defaults" workflows.
+  Reference: `linenoise.c::linenoisePreloadBuffer`.
+- **Brace-matching highlight helper.** Built-in `HighlightHook`
+  helper exposed as `zigline.builtin.brace_matcher`. When cursor
+  is on (or just past) `(` `[` `{`, walks the buffer, finds the
+  matching close, emits a reverse-video `HighlightSpan`. Apps opt
+  in by setting `Options.highlight = brace_matcher`. Reference:
+  `isocline/src/highlight.c::highlight_match_braces`.
+- **Visual selection.** Shift-arrow / Shift-Home/End select a
+  range; subsequent kill / yank / case ops operate on the
+  selection. Adds a "selection" state to `Buffer` and selection-
+  aware action arms. Substantial; post-v1.0 unless demanded.
+  Reference: `reedline/src/core_editor/editor.rs` SelectMode.
 
 ## API
 
+- **Multiplexing API (`editStart` / `editFeed` / `editStop`).**
+  Today `readLine` is blocking-only. Splitting it into start /
+  feed-with-available-bytes / stop lets applications integrate
+  zigline into their own event loop (`select` / `poll` / `epoll`),
+  mixing terminal input with sockets, IPC, timers. Pairs with
+  `Editor.print` (below) for the "print to screen while user is
+  typing" use case. Reference: `linenoise.c::linenoiseEditStart`,
+  `linenoiseEditFeed`, `linenoiseEditStop`. Architectural change;
+  v0.3 or beyond.
+- **Async-safe `Editor.print` / `printAbove`.** Print text above
+  the prompt without disrupting editing. Internally finalizes the
+  rendered block, writes the message, re-renders. Pairs with the
+  multiplexing API for shells with background tasks. Reference:
+  `linenoise.c::linenoiseHide` / `linenoiseShow`,
+  `reedline::external_printer::ExternalPrinter`,
+  `isocline::ic_print`.
+- **Async stop.** `Editor.asyncStop()` thread-safe poke of the
+  self-pipe to interrupt a blocking `readLine` from another
+  thread. We have the self-pipe; this would be a public ~20 line
+  shim. Useful for daemon REPLs and integration test timeouts.
+  Reference: `isocline::ic_async_stop`.
+- **Programmatic key-press injection.** `Editor.injectKeyPress(KeyEvent)`
+  pushes an event into the input pipeline as if the user typed it.
+  Useful for testing (drive integration tests deterministically
+  without PTY) and for chord-macro features. Reference:
+  `replxx_emulate_key_press`.
 - **Async completion.** Completion provider returns a future / token
   the editor polls; UX shows "computing…" while in flight.
 - **Narrower error sets.** v0.1 hooks return `anyerror`; tighten to
@@ -156,6 +283,12 @@ concrete bullet list.
   allocator. Reduce if over budget.
 - **Startup cost.** Time from `Editor.init` to first prompt.
   Target ≤10ms cold (without history file load).
+- **History load throughput.** `History.load` currently does
+  per-line allocation. Bestline's note says they made history
+  loading 10x faster vs linenoise; the trick is mmap + slice,
+  no per-entry copy. Worth profiling before optimizing.
+  Reference: `bestline.c` (search for "history" + read the load
+  routine).
 
 ## Documentation
 
