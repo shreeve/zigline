@@ -493,6 +493,210 @@ Dispatch handles the line-lifecycle terminals (`accept_line`,
 `cancel_line`, `eof`) — those don't mutate buffer state in a normal
 way; they end the read.
 
+### §5.1 Keymap and binding-table (v1.0)
+
+The v0.x `Keymap` is a single function pointer:
+
+```zig
+pub const Keymap = struct {
+    lookupFn: *const fn (KeyEvent) ?Action,
+
+    pub fn lookup(self: Keymap, key: KeyEvent) ?Action {
+        return self.lookupFn(key);
+    }
+
+    pub fn defaultEmacs() Keymap { ... }
+};
+```
+
+This shape stays exactly as is — STABILITY.md commits to it. The v1.0
+binding-table is an **additive** overlay, optional, opt-in:
+
+```zig
+pub const Keymap = struct {
+    lookupFn: *const fn (KeyEvent) ?Action,
+    /// Optional multi-key binding overlay. Consulted before
+    /// `lookupFn`. `null` preserves v0.x behavior exactly.
+    bindings: ?*BindingTable = null,
+    ...
+};
+```
+
+When `bindings` is non-null, dispatch consults it first (see §5.2);
+the legacy `lookupFn` is the fall-through for unbound single keys.
+This composes cleanly with the consumer-side fall-through pattern
+slash already uses: their `keymapLookup` returns `?Action`, falling
+through to `defaultEmacs()` for anything they didn't bind.
+
+```zig
+/// Mutable storage for `[]KeyEvent → Action` bindings, including
+/// multi-key sequences. Owned by the application; passed to
+/// `Keymap.bindings`. Not allocator-tied to the editor — apps can
+/// reuse one binding-table across multiple editor instances.
+pub const BindingTable = struct {
+    pub fn init(allocator: Allocator) BindingTable;
+    pub fn deinit(self: *BindingTable) void;
+
+    /// Bind a sequence to an action. Last bind wins on conflict;
+    /// no error is returned if `seq` shadows an existing binding.
+    /// Returns the previous action if any (for "save and restore"
+    /// patterns).
+    pub fn bind(
+        self: *BindingTable,
+        seq: []const KeyEvent,
+        action: Action,
+    ) !?Action;
+
+    /// Remove a binding. Returns true if a binding was removed,
+    /// false if `seq` wasn't bound.
+    pub fn unbind(self: *BindingTable, seq: []const KeyEvent) bool;
+
+    /// Resolve a sequence against the binding-table.
+    pub fn lookup(
+        self: *const BindingTable,
+        seq: []const KeyEvent,
+    ) Result;
+
+    pub const Result = union(enum) {
+        /// No binding starts with this prefix. Editor falls back to
+        /// the legacy `lookupFn` for the first event in the sequence
+        /// and re-processes the remainder.
+        none,
+        /// One or more bindings start with this prefix; no exact
+        /// match yet. Editor buffers and waits for the next event.
+        partial,
+        /// Exact match. Editor dispatches the action and clears the
+        /// pending buffer.
+        bound: Action,
+    };
+};
+```
+
+**Key sequences as `[]const KeyEvent`.** No string-grammar parser
+in the v1.0 surface (e.g., no `KeySequence.parse("C-x C-e")` helper).
+Apps build sequences with literal `KeyEvent` values; the keymap-
+configuration layer is the app's responsibility. Adding a parser is
+a v1.x non-breaking addition if demand surfaces.
+
+**Storage is implementation detail** — a radix-trie keyed by
+encoded `KeyEvent` (per `rustyline/src/binding.rs::encode`) is the
+expected default, but the API contract is the `Result` enum, not the
+storage shape.
+
+**Mutability.** `bind`/`unbind` are mutators. Apps may rebind
+between `readLine` calls. The dispatcher reads the table during a
+`readLine`; mutating during `readLine` is undefined. Single-thread
+expectation; no locks.
+
+**Discovery.** Out of scope for v1.0. Apps that need to dump
+bindings (F1 help overlay, etc.) keep their own bookkeeping;
+`BindingTable` is write-then-read, not introspectable.
+
+**Not in scope (the discipline that keeps this from sloping):**
+
+- Modal keymaps. Vi-mode insert vs normal stays a separate
+  `FUTURE.md` feature; the binding-table doesn't make it easier or
+  harder.
+- Keyboard macros / chord recording. Separate concept.
+- inputrc-style config file parsing. Apps build their own parser
+  if they want one.
+- Layered/stacked keymaps with priority. Apps compose by chaining
+  fall-through functions, as slash already does.
+- Conflict-resolution UI. Last-bind-wins, no warnings.
+- Runtime thread-safety. Single-thread expectation, documented.
+
+If any of those become real requests post-v1.0, they ship as
+separate features. The binding-table itself is bounded.
+
+### §5.2 Dispatch state machine for multi-key sequences
+
+When `Keymap.bindings != null`, the dispatch loop maintains a
+small per-`readLine` event buffer:
+
+```zig
+pending_keys: std.ArrayListUnmanaged(KeyEvent) = .empty,
+```
+
+On each `KeyEvent`:
+
+1. **Append** the event to `pending_keys`.
+2. **Lookup** `bindings.lookup(pending_keys.items)`:
+   - `.bound = action` → dispatch `action`, clear `pending_keys`.
+   - `.partial` → continue (wait for next event).
+   - `.none` →
+     - If `pending_keys.len == 1`: this single event has no multi-
+       key binding. Fall through to `lookupFn(event)` for the legacy
+       single-key path. Dispatch any returned action. Clear
+       `pending_keys`.
+     - If `pending_keys.len > 1`: the buffered prefix didn't
+       resolve. Dispatch the **first** event via `lookupFn` (as a
+       singleton), then **re-process** the remaining events through
+       this state machine. Clear `pending_keys` only after replay
+       completes. (Matches readline's "abandoned chord" behavior.)
+
+**Non-key events resolve partial sequences as singletons.**
+Bracketed paste, resize, EOF, error — none of these can extend a
+key chord. If `pending_keys` is non-empty when one arrives:
+
+1. Resolve the buffered prefix as if a non-matching key had
+   arrived (the `.none` + `len > 1` branch above).
+2. Then process the non-key event normally.
+
+**Timeout policy.** None in v1.0. The editor waits indefinitely for
+the next event after a `.partial`. Bash and emacs do the same;
+configurable timeout is post-v1.0 (already in `FUTURE.md` as
+`Options.timeouts.chord_resolve_ms`).
+
+**Interaction with `quoted_insert` (`Ctrl-V`/`Ctrl-Q`).**
+`quoted_insert` is a single-key action that flips `Editor.quoted_
+insert_pending`. The next event bypasses *both* the binding-table
+and `lookupFn` and is inserted literally. If `quoted_insert_pending`
+is set when the next event arrives, the binding-table is not
+consulted; `pending_keys` is cleared.
+
+**Interaction with `Action.custom`.** Custom actions are bound
+exactly like built-in actions: `table.bind(seq, .{ .custom = 7 })`.
+The dispatcher resolves the sequence then routes to
+`handleCustomAction(7)` as it does today for single-key custom
+bindings.
+
+**Memory bound on `pending_keys`.** Capped at 8 events. Beyond
+that, the buffer is force-resolved as singletons-and-replay (same
+as `.none + len > 1`). No real keymap binds sequences longer than
+3-4 events; the cap is paranoia.
+
+**Cooked-mode fallback.** No keymap; the binding-table is not
+consulted. Cooked-mode reads delegate to the kernel discipline.
+
+### §5.3 Migration path for existing consumers
+
+Consumers on v0.x `Keymap` (function pointer only) keep working
+unchanged. The new field defaults to `null`; opting in is explicit:
+
+```zig
+// v0.x — still works in v1.0:
+var editor = try Editor.init(alloc, .{
+    .keymap = .{ .lookupFn = myLookup },
+});
+
+// v1.0 — multi-key bindings:
+var bindings = BindingTable.init(alloc);
+defer bindings.deinit();
+_ = try bindings.bind(&[_]KeyEvent{
+    .{ .code = .{ .char = 'x' }, .mods = .{ .ctrl = true } },
+    .{ .code = .{ .char = 'e' }, .mods = .{ .ctrl = true } },
+}, .{ .custom = ACTION_EDIT_IN_EDITOR });
+
+var editor = try Editor.init(alloc, .{
+    .keymap = .{
+        .lookupFn = myLookup,
+        .bindings = &bindings,
+    },
+});
+```
+
+No breaking changes; `lookupFn` semantics preserved verbatim.
+
 ---
 
 ## §6 Render model
@@ -943,25 +1147,86 @@ scaffolded API + lifted code, not a polish target.
 
 ### v0.2 scope
 
-- Row-granular diff renderer.
-- Configurable WidthPolicy (ambiguous-width).
-- More completion menu UI (multi-column listing, scrolling).
-- vi-mode keymap.
-- Completion of partial Unicode input.
-- Diagnostic-fn for hook errors.
+The two named blockers between zigline-as-it-ships-today and a
+real v1.0 commitment. Both are concrete features with reference
+implementations in `misc/`; both are bounded scope (see §5.1's
+"not in scope" list for binding-table, and the columnar layout
+constraint for the menu).
 
-### v0.3 and beyond
+- **Binding-table API on `Keymap`** (§5.1, §5.2). Multi-key
+  sequences (`Ctrl-X Ctrl-E`, `Ctrl-X Ctrl-X`, etc.). Adds the
+  `BindingTable` type as an opt-in overlay; `Keymap.lookupFn` shape
+  preserved. Reference: `rustyline/src/binding.rs::encode`.
+  Unblocks: mark-and-point, `Ctrl-X Ctrl-E` for edit-in-EDITOR,
+  any future X-prefix vocabulary.
+- **Multi-column completion menu UI**. Replaces the v0.x single-
+  line space-separated placeholder with a columnar layout sized
+  to terminal width, paged for overflow, keyboard-navigable.
+  Reference: `reedline/src/menu/columnar_menu.rs::create_string`.
+  We lift the layout math; we don't lift the trait abstraction
+  (zigline ships one menu type, not three).
+- **One real-world consumer release cycle.** Slash shipping a
+  release with zigline embedded and observing what surfaces in
+  the field. Calendar work, not zigline keyboard work.
+
+### v0.x continuing additions (non-breaking)
+
+These ship in v0.1.x and v0.2.x as they're written. Each is
+additive and obeys the v1.0 stability surface in `STABILITY.md`.
+
+- Row-granular diff renderer.
+- Configurable `WidthPolicy` (ambiguous-width policy wired
+  through to the segmenter).
+- Validator hook ("is this expression complete?").
+- Hints / fish-style autosuggestions (renders through the
+  existing `HighlightHook`).
+- Mask mode for password input.
+- `Editor.preloadBuffer` helper.
+- Brace-matching highlight helper as a built-in `HighlightHook`.
+- Per-`Options` knobs for completion behavior (double-tab,
+  immediate, beep-on-ambiguous, count-cutoff).
+- `Editor.print` / `printAbove` for async-safe output above the
+  prompt; `Editor.asyncStop` for cross-thread interrupt.
+
+These don't gate v1.0 — they ship as ready and the version bumps
+as they land. v1.0 = v0.x + binding-table + menu + slash release
+cycle done.
+
+### v1.0 surface freeze
+
+When the three v0.2 items above are done, we tag v1.0.0. From that
+point on:
+
+- Symbols listed in `STABILITY.md` are locked: removing a public
+  symbol, changing a signature, adding a required field, or
+  adding a tagged-union variant requires a v2.0 major bump.
+- Behavior documented in this SPEC is binding. Changing observable
+  behavior (cursor lands at end vs middle, `:cq` triggers no_op
+  vs accept_line, etc.) requires a v2.0 bump.
+- The `STABILITY.md` "experimental in v1.x" set (e.g.
+  `Diagnostic.Kind` variants, `KillRing`/`Changeset` internals)
+  may evolve in minor releases.
+
+### v0.3 and beyond (post-v1.0)
 
 - Cell-level diff renderer (if profiling justifies).
 - Multi-line text-area mode (cursor moves between rows of a buffer
   containing `\n`).
+- vi-mode keymap. Builds on the binding-table primitive.
 - Async completion.
 - Mouse support.
+- Reverse-incremental history search (Ctrl-R UI).
+- Visual selection.
+- Configurable parser timeouts (including chord-resolution
+  timeout for the binding-table state machine).
 - Theme system / config.
+- Multiplexing API (`editStart`/`editFeed`/`editStop`) for
+  applications integrating zigline into their own event loop.
 
 ### Stability promises
 
-- v0.x: no compatibility promises. The API will move.
+- v0.x: no compatibility promises. The API will move (within the
+  shape documented in `STABILITY.md`).
 - v1.0: SemVer applies. Breaking changes require a major bump.
 - The SPEC.md document is part of the API contract: behavior
   documented here is binding from v1.0 onward.
