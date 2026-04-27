@@ -63,8 +63,9 @@ for the hook-based extension points.
 v0.1. Targets Zig 0.16. Depends on `zg` for grapheme cluster
 boundaries and East Asian Width data; no other dependencies.
 
-See [`SPEC.md`](SPEC.md) for the design constitution, [`FUTURE.md`](FUTURE.md)
-for deferred work.
+See [`SPEC.md`](SPEC.md) for the design constitution,
+[`STABILITY.md`](STABILITY.md) for the v1.0 stable-surface commitment,
+and [`FUTURE.md`](FUTURE.md) for deferred work.
 
 ## License
 
