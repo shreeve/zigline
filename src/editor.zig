@@ -506,33 +506,40 @@ pub const Editor = struct {
                 self.changeset.breakSequence();
                 return null;
             },
-            .accept_line => {
-                try self.renderer.finalize(&self.terminal);
-                const out = try self.buffer.take();
-                self.changeset.clear();
-                if (self.options.history) |h| {
-                    if (out.len > 0) {
-                        h.append(out) catch |err| {
-                            self.diag(.{ .kind = .history_append_failed, .err = err });
-                        };
-                    }
-                }
-                return ReadLineResult{ .line = out };
-            },
-            .cancel_line => {
-                try self.renderer.finalize(&self.terminal);
-                // Echo `^C` ourselves only when raw mode is active —
-                // in cooked mode the kernel discipline already echoes
-                // the interrupt indicator for us.
-                if (self.options.raw_mode != .disabled and self.terminal.isInputTty()) {
-                    self.terminal.writeAll("^C\r\n") catch {};
-                }
-                self.buffer.clear();
-                self.changeset.clear();
-                self.renderer.markFresh();
-                return ReadLineResult{ .interrupt = {} };
-            },
+            .accept_line => return try self.acceptCurrentLine(),
+            .cancel_line => return try self.cancelCurrentLine(),
         }
+    }
+
+    /// Finalize the rendered block, take the buffer, append to
+    /// history. Shared between the `.accept_line` action arm and the
+    /// custom-action `.accept_line` result variant.
+    fn acceptCurrentLine(self: *Editor) !ReadLineResult {
+        try self.renderer.finalize(&self.terminal);
+        const out = try self.buffer.take();
+        self.changeset.clear();
+        if (self.options.history) |h| {
+            if (out.len > 0) {
+                h.append(out) catch |err| {
+                    self.diag(.{ .kind = .history_append_failed, .err = err });
+                };
+            }
+        }
+        return ReadLineResult{ .line = out };
+    }
+
+    /// Finalize, echo `^C` if raw, clear buffer + undo. Shared
+    /// between the `.cancel_line` action arm and the custom-action
+    /// `.cancel_line` result variant.
+    fn cancelCurrentLine(self: *Editor) !ReadLineResult {
+        try self.renderer.finalize(&self.terminal);
+        if (self.options.raw_mode != .disabled and self.terminal.isInputTty()) {
+            self.terminal.writeAll("^C\r\n") catch {};
+        }
+        self.buffer.clear();
+        self.changeset.clear();
+        self.renderer.markFresh();
+        return ReadLineResult{ .interrupt = {} };
     }
 
     /// Best-effort record helpers: if recording fails (OOM), the
@@ -691,29 +698,8 @@ pub const Editor = struct {
                 }
             },
             .complete => try self.handleComplete(prompt),
-            .accept_line => {
-                try self.renderer.finalize(&self.terminal);
-                const out = try self.buffer.take();
-                self.changeset.clear();
-                if (self.options.history) |h| {
-                    if (out.len > 0) {
-                        h.append(out) catch |err| {
-                            self.diag(.{ .kind = .history_append_failed, .err = err });
-                        };
-                    }
-                }
-                return ReadLineResult{ .line = out };
-            },
-            .cancel_line => {
-                // Move past the rendered block so "^C" doesn't print
-                // mid-prompt when the cursor was on a leading row.
-                try self.renderer.finalize(&self.terminal);
-                try self.terminal.writeAll("^C\r\n");
-                self.buffer.clear();
-                self.changeset.clear();
-                self.renderer.markFresh();
-                return ReadLineResult{ .interrupt = {} };
-            },
+            .accept_line => return try self.acceptCurrentLine(),
+            .cancel_line => return try self.cancelCurrentLine(),
             .eof => {
                 if (self.buffer.isEmpty()) {
                     try self.renderer.finalize(&self.terminal);
