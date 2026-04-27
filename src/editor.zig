@@ -91,7 +91,12 @@ pub const CustomActionContext = struct {
     /// this before spawning a process that reads from / writes to
     /// stdin/stdout (an editor, pager, password prompt). Pairs with
     /// `resumeRawMode`. Idempotent: calling twice is safe.
+    ///
+    /// No-op when the input fd isn't a TTY (cooked-mode read path).
+    /// Raw mode is meaningless without a TTY, so there's nothing to
+    /// pause; helpers like `withCookedMode` still work in this mode.
     pub fn pauseRawMode(self: CustomActionContext) !void {
+        if (!self.editor.terminal.isInputTty()) return;
         try self.editor.renderer.finalize(&self.editor.terminal);
         self.editor.terminal.leaveRawMode();
     }
@@ -102,9 +107,53 @@ pub const CustomActionContext = struct {
     /// so there's no guarantee of column 0; the hook should ensure
     /// the spawned process exited with a newline if visual layout
     /// matters.
+    ///
+    /// No-op when the input fd isn't a TTY — symmetric with
+    /// `pauseRawMode`.
     pub fn resumeRawMode(self: CustomActionContext) !void {
+        if (!self.editor.terminal.isInputTty()) return;
         try self.editor.terminal.enterRawMode();
         self.editor.renderer.markFresh();
+    }
+
+    /// Run `func(context)` with raw mode paused. Pauses → calls →
+    /// resumes; returns the function's value or propagates its
+    /// error. Prefer this over manual `pauseRawMode()` + `defer
+    /// resumeRawMode() catch {};` — the deferred form silently
+    /// swallows resume failures, leaving the user stuck in cooked
+    /// mode if the terminal got into a weird state.
+    ///
+    /// `func` must be a function taking `@TypeOf(context)` and
+    /// returning `anyerror!T` for any `T` (commonly `void` for
+    /// "spawn and wait" helpers, or `CustomActionResult` if the
+    /// hook computes its result entirely inside the cooked-mode
+    /// scope).
+    ///
+    /// Error semantics:
+    /// - `pauseRawMode` failure: propagated; `func` is not called.
+    /// - `func` failure: propagated; we still try to resume raw
+    ///   mode and surface any resume failure through the
+    ///   diagnostic hook so the caller sees the original error.
+    /// - `resumeRawMode` failure after a successful `func`:
+    ///   propagated.
+    pub fn withCookedMode(
+        self: CustomActionContext,
+        context: anytype,
+        comptime func: anytype,
+    ) @typeInfo(@TypeOf(func)).@"fn".return_type.? {
+        try self.pauseRawMode();
+        const result = func(context) catch |err| {
+            self.resumeRawMode() catch |re| {
+                self.editor.diag(.{
+                    .kind = .render_failed,
+                    .err = re,
+                    .detail = "withCookedMode: resumeRawMode failed after func error",
+                });
+            };
+            return err;
+        };
+        try self.resumeRawMode();
+        return result;
     }
 };
 
@@ -115,6 +164,11 @@ pub const CustomActionContext = struct {
 pub const CustomActionResult = union(enum) {
     /// Hook ran, no buffer change. (E.g. printed help to stderr,
     /// recorded analytics, opened an external help overlay.)
+    /// Also the canonical "user aborted" path — if a hook spawns
+    /// `$EDITOR` and the user exits without saving (`:cq` in vi,
+    /// non-zero exit), return `.no_op`. The buffer stays as it was
+    /// before the action; no separate `.action_cancelled` variant
+    /// is needed.
     no_op,
     /// Insert this text at the cursor. Editor records as a normal
     /// undo step. Allocator-owned by the hook (allocator passed
@@ -1396,6 +1450,35 @@ test "editor: custom action cancel_line returns interrupt + clears state" {
     try std.testing.expect(result.? == .interrupt);
     try std.testing.expectEqualStrings("", editor.buffer.slice());
     try std.testing.expect(!editor.changeset.canUndo());
+}
+
+const WCMCtx = struct {
+    invoked: bool = false,
+    return_err: bool = false,
+};
+
+fn wcmFunc(ctx: *WCMCtx) anyerror!void {
+    ctx.invoked = true;
+    if (ctx.return_err) return error.TestSpawnFailed;
+}
+
+test "editor: withCookedMode runs func + propagates value" {
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled });
+    defer editor.deinit();
+    var wcm: WCMCtx = .{};
+    const action_ctx: CustomActionContext = .{ .editor = &editor };
+    try action_ctx.withCookedMode(&wcm, wcmFunc);
+    try std.testing.expect(wcm.invoked);
+}
+
+test "editor: withCookedMode propagates func errors" {
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled });
+    defer editor.deinit();
+    var wcm: WCMCtx = .{ .return_err = true };
+    const action_ctx: CustomActionContext = .{ .editor = &editor };
+    const result = action_ctx.withCookedMode(&wcm, wcmFunc);
+    try std.testing.expectError(error.TestSpawnFailed, result);
+    try std.testing.expect(wcm.invoked);
 }
 
 

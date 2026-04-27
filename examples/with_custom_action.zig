@@ -78,20 +78,10 @@ fn editInEditor(
     }
     defer _ = std.c.unlink(tmp_path.ptr);
 
-    try action_ctx.pauseRawMode();
-    defer action_ctx.resumeRawMode() catch {};
-
-    const editor_cmd = std.c.getenv("EDITOR") orelse "vi";
-    const cmd_z: [*:0]const u8 = @ptrCast(editor_cmd);
-    var argv = [_:null]?[*:0]const u8{ cmd_z, tmp_path.ptr };
-    const child = std.c.fork();
-    if (child < 0) return error.ForkFailed;
-    if (child == 0) {
-        _ = execvp(cmd_z, &argv);
-        std.c._exit(127);
-    }
-    var status: c_int = 0;
-    _ = std.c.waitpid(child, &status, 0);
+    // `withCookedMode` brackets the spawn with pause + resume. Any
+    // failure to re-enter raw mode is propagated, not silently
+    // swallowed (`defer ... catch {}` is the trap to avoid).
+    try action_ctx.withCookedMode(tmp_path, spawnEditor);
 
     const fd = std.c.open(tmp_path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.OpenFailed;
@@ -106,10 +96,32 @@ fn editInEditor(
         try bytes.appendSlice(allocator, chunk[0..@intCast(n)]);
     }
     var content = try bytes.toOwnedSlice(allocator);
-    if (content.len > 0 and content[content.len - 1] == '\n') {
+    // Editors append varying amounts of trailing whitespace: vi
+    // adds a single `\n`; some emit `\r\n`; some emit a double
+    // `\n`. Strip them all so the buffer round-trip is clean.
+    while (content.len > 0 and (content[content.len - 1] == '\n' or
+        content[content.len - 1] == '\r'))
+    {
         content = try allocator.realloc(content, content.len - 1);
     }
     return .{ .replace_buffer = content };
+}
+
+/// Fork + execvp `$EDITOR` (or `vi` if unset) to edit `tmp_path`,
+/// then wait. Runs while the terminal is in cooked mode so the
+/// editor sees a normal TTY.
+fn spawnEditor(tmp_path: [:0]const u8) anyerror!void {
+    const editor_cmd = std.c.getenv("EDITOR") orelse "vi";
+    const cmd_z: [*:0]const u8 = @ptrCast(editor_cmd);
+    var argv = [_:null]?[*:0]const u8{ cmd_z, tmp_path.ptr };
+    const child = std.c.fork();
+    if (child < 0) return error.ForkFailed;
+    if (child == 0) {
+        _ = execvp(cmd_z, &argv);
+        std.c._exit(127);
+    }
+    var status: c_int = 0;
+    _ = std.c.waitpid(child, &status, 0);
 }
 
 pub fn main(init: std.process.Init) !u8 {

@@ -65,6 +65,22 @@ the cursor-navigation methods, `HistoryOptions` field set.
 `CustomActionHook`, `CustomActionRequest`, `CustomActionResult`,
 `CustomActionContext`. `DiagnosticHook` and `Diagnostic` struct shape.
 
+**Custom-action ID conventions.** `Action.custom: u32` IDs are opaque
+to zigline; applications assign their own labels. Recommended
+discipline:
+
+- Treat `0` as invalid/unbound. First-party application IDs start at
+  `1`.
+- If you build a plugin system where third-party code can register
+  custom actions, namespace via the top byte (`0xPP_xxxxxx` where
+  `PP` is the plugin ID) or a hash of the plugin name. Reserve the
+  bottom range (e.g. `< 0x01000000`) for the host application's own
+  actions.
+- `CustomActionResult.no_op` is the canonical "user aborted" path —
+  e.g. when an `$EDITOR` exits non-zero. There is no separate
+  `.action_cancelled` variant; the buffer simply stays as it was
+  before the action.
+
 **Width / Unicode.**
 `WidthPolicy` field set.
 
