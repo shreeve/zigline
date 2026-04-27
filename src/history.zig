@@ -1,0 +1,220 @@
+//! History — in-memory navigation + persistent flat-file storage.
+//!
+//! See SPEC.md §8. One line per entry, UTF-8, no metadata in v0.1.
+//! Caller owns construction and passes via `Editor.Options.history`.
+//!
+//! Lifted from slash's `History` (src/repl.zig) with these changes:
+//!   - the persistence path is configured via `HistoryOptions`, not
+//!     hardcoded to `~/.slash/history`.
+//!   - dedup policy (none / adjacent / all) is applied consistently;
+//!     slash's `append` had a bug where exact-duplicate lines still
+//!     got persisted (SPEC.md §14).
+//!   - `max_entries` prunes at append time.
+
+const std = @import("std");
+
+pub const Allocator = std.mem.Allocator;
+
+pub const HistoryOptions = struct {
+    path: ?[]const u8 = null,
+    max_entries: usize = 1000,
+    dedupe: Dedupe = .adjacent,
+};
+
+pub const Dedupe = enum {
+    none,
+    adjacent,
+    all,
+};
+
+pub const History = struct {
+    allocator: Allocator,
+    options: HistoryOptions,
+    entries: std.ArrayListUnmanaged([]u8) = .empty,
+    cursor: ?usize = null,
+    snapshot: ?[]u8 = null,
+    /// Owned copy of options.path so it outlives caller-owned input.
+    owned_path: ?[]u8 = null,
+
+    pub fn init(allocator: Allocator, options: HistoryOptions) !History {
+        var h: History = .{ .allocator = allocator, .options = options };
+        if (options.path) |p| {
+            h.owned_path = try allocator.dupe(u8, p);
+            try h.load();
+        }
+        return h;
+    }
+
+    pub fn deinit(self: *History) void {
+        for (self.entries.items) |e| self.allocator.free(e);
+        self.entries.deinit(self.allocator);
+        if (self.snapshot) |s| self.allocator.free(s);
+        if (self.owned_path) |p| self.allocator.free(p);
+    }
+
+    fn load(self: *History) !void {
+        const path = self.owned_path orelse return;
+        const path_z = try self.allocator.dupeZ(u8, path);
+        defer self.allocator.free(path_z);
+
+        const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+        if (fd < 0) return; // missing history is fine
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = std.c.read(fd, &chunk, chunk.len);
+            if (n < 0) break;
+            if (n == 0) break;
+            try buf.appendSlice(self.allocator, chunk[0..@intCast(n)]);
+        }
+        _ = std.c.close(fd);
+
+        var it = std.mem.splitScalar(u8, buf.items, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            const dup = try self.allocator.dupe(u8, line);
+            try self.entries.append(self.allocator, dup);
+        }
+        try self.applyMaxEntries();
+    }
+
+    pub fn append(self: *History, line: []const u8) !void {
+        if (line.len == 0) return;
+
+        // Apply dedup policy.
+        switch (self.options.dedupe) {
+            .none => {},
+            .adjacent => {
+                if (self.entries.items.len > 0) {
+                    const last = self.entries.items[self.entries.items.len - 1];
+                    if (std.mem.eql(u8, last, line)) return; // skip both in-mem and persist
+                }
+            },
+            .all => {
+                var i: usize = 0;
+                while (i < self.entries.items.len) {
+                    if (std.mem.eql(u8, self.entries.items[i], line)) {
+                        self.allocator.free(self.entries.items[i]);
+                        _ = self.entries.orderedRemove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+            },
+        }
+
+        const dup = try self.allocator.dupe(u8, line);
+        try self.entries.append(self.allocator, dup);
+        try self.applyMaxEntries();
+        self.persistAppend(line) catch {};
+    }
+
+    fn applyMaxEntries(self: *History) !void {
+        if (self.options.max_entries == 0) return;
+        while (self.entries.items.len > self.options.max_entries) {
+            const oldest = self.entries.orderedRemove(0);
+            self.allocator.free(oldest);
+        }
+    }
+
+    pub fn previous(self: *History, current: []const u8) ?[]const u8 {
+        if (self.entries.items.len == 0) return null;
+        if (self.cursor == null) {
+            if (self.snapshot) |s| self.allocator.free(s);
+            self.snapshot = self.allocator.dupe(u8, current) catch null;
+            self.cursor = self.entries.items.len;
+        }
+        if (self.cursor.? == 0) return null;
+        self.cursor = self.cursor.? - 1;
+        return self.entries.items[self.cursor.?];
+    }
+
+    pub fn next(self: *History) ?[]const u8 {
+        const cur = self.cursor orelse return null;
+        if (cur + 1 < self.entries.items.len) {
+            self.cursor = cur + 1;
+            return self.entries.items[cur + 1];
+        }
+        self.cursor = null;
+        if (self.snapshot) |s| return s;
+        return "";
+    }
+
+    pub fn resetCursor(self: *History) void {
+        self.cursor = null;
+        if (self.snapshot) |s| {
+            self.allocator.free(s);
+            self.snapshot = null;
+        }
+    }
+
+    fn persistAppend(self: *History, line: []const u8) !void {
+        const path = self.owned_path orelse return;
+        const path_z = try self.allocator.dupeZ(u8, path);
+        defer self.allocator.free(path_z);
+        const fd = std.c.open(
+            path_z.ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true },
+            @as(std.c.mode_t, 0o600),
+        );
+        if (fd < 0) return;
+        defer _ = std.c.close(fd);
+        _ = std.c.write(fd, line.ptr, line.len);
+        _ = std.c.write(fd, "\n", 1);
+    }
+};
+
+test "history: append + navigate" {
+    var h = try History.init(std.testing.allocator, .{});
+    defer h.deinit();
+
+    try h.append("first");
+    try h.append("second");
+
+    try std.testing.expectEqualStrings("second", h.previous("").?);
+    try std.testing.expectEqualStrings("first", h.previous("").?);
+    try std.testing.expect(h.previous("") == null); // off the top
+    try std.testing.expectEqualStrings("second", h.next().?);
+    // past-the-end returns the snapshot
+    try std.testing.expectEqualStrings("", h.next().?);
+}
+
+test "history: dedup adjacent skips repeat" {
+    var h = try History.init(std.testing.allocator, .{ .dedupe = .adjacent });
+    defer h.deinit();
+
+    try h.append("ls");
+    try h.append("ls");
+    try h.append("cd /");
+
+    try std.testing.expectEqual(@as(usize, 2), h.entries.items.len);
+}
+
+test "history: dedup all removes earlier copies" {
+    var h = try History.init(std.testing.allocator, .{ .dedupe = .all });
+    defer h.deinit();
+
+    try h.append("a");
+    try h.append("b");
+    try h.append("a");
+
+    try std.testing.expectEqual(@as(usize, 2), h.entries.items.len);
+    try std.testing.expectEqualStrings("b", h.entries.items[0]);
+    try std.testing.expectEqualStrings("a", h.entries.items[1]);
+}
+
+test "history: max_entries prunes oldest" {
+    var h = try History.init(std.testing.allocator, .{ .max_entries = 3 });
+    defer h.deinit();
+
+    try h.append("a");
+    try h.append("b");
+    try h.append("c");
+    try h.append("d");
+
+    try std.testing.expectEqual(@as(usize, 3), h.entries.items.len);
+    try std.testing.expectEqualStrings("b", h.entries.items[0]);
+    try std.testing.expectEqualStrings("d", h.entries.items[2]);
+}

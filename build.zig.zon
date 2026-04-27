@@ -1,0 +1,27 @@
+.{
+    .name = .zigline,
+    .version = "0.1.0",
+    .fingerprint = 0x21cdce3e44b7ce18,
+    .minimum_zig_version = "0.16.0",
+
+    // zigline depends on `zg` for Unicode grapheme cluster boundaries
+    // (UAX #29) and East Asian Width data — see SPEC.md §3.6.
+    .dependencies = .{
+        .zg = .{
+            .url = "https://codeberg.org/atman/zg/archive/master.tar.gz",
+            .hash = "zg-0.15.3-oGqU3BaetgIIRXXxyGsXtvmYgi1XLf4HHvHswqsgLo-Y",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "tests",
+        "LICENSE",
+        "README.md",
+        "SPEC.md",
+        "FUTURE.md",
+    },
+}
