@@ -45,7 +45,7 @@ Read the section that matches your knowledge baseline.
 
 ### Optional inputs (helpful but not required)
 
-- **A peer AI for review rounds** — the nexus migration benefited materially from pre-execution critique and post-execution review via the `user-ai` MCP's `discuss` tool. Not required; scales the quality bar.
+- **A peer AI for review rounds** — the source migration benefited materially from pre-execution critique and post-execution review via the `user-ai` MCP's `discuss` tool. Not required; scales the quality bar.
 - **Pre-0.15 code?** If your codebase predates 0.15.x (still uses `usingnamespace`, `async`/`await` keywords, old format string `{}` without `{f}`/`{any}`, or managed `ArrayList.init(alloc)` patterns), do a 0.15 → 0.15.x pass first. This kit assumes your code already compiled under 0.15.x.
 
 ---
@@ -138,7 +138,7 @@ Go.
 
 1. **Phase 0 — Empirical baseline.** `zig build` with no code changes. Capture the first error. Do not edit yet.
 2. **Phase 1 — One API family at a time.** In this order: `main()` signature → file I/O → Writer/Reader pattern → misc renames. `zig build` between each.
-3. **Phase 2 — Verify API shapes against stdlib.** Before mass-editing, grep the installed stdlib for exact signatures. 5 minutes saved ~10 compile-fix cycles on the nexus port.
+3. **Phase 2 — Verify API shapes against stdlib.** Before mass-editing, grep the installed stdlib for exact signatures. 5 minutes saved ~10 compile-fix cycles on the source port.
 4. **Phase 3 — Regenerate (if applicable).** For codebases with generated files (parser output, protobuf, etc.): fix the generator's emit templates to produce 0.16-compatible output, then regenerate. Diff against git — expect only the migrated patterns.
 5. **Phase 4 — Test with a real workload.** `zig build test` plus any project-specific tests. Time a large input. If you see 10×+ slowdown vs 0.15, you've likely hit the DebugAllocator trap — see the ⚠️ section.
 6. **Final sweep — grep safety nets.** Run the grep commands from Workflow Tactics. Zero matches on all = high confidence migration is complete.
@@ -1684,7 +1684,7 @@ This is one of the most impactful 0.16 behavioral changes for programs migrating
 
 **DebugAllocator's per-allocation bookkeeping is O(n) in the live-allocation count.** When that count grows — because your program has long-lived allocations, or (worse) leaks that don't free until exit — every subsequent allocation does a lookup against a larger tracking set. In practice this translates to **up to 1400× slowdown** for programs that do many small allocations and retain most of them.
 
-Concrete data from a real migration (the `nexus` parser generator, 0.15.2 → 0.16.0):
+Concrete data from a real migration (a 7,300-line parser generator, 0.15.2 → 0.16.0):
 
 | Workload | page_allocator (0.15) | init.gpa (0.16 Debug) | init.arena (0.16 Debug) | slowdown vs arena |
 |---|---|---|---|---|
@@ -1699,7 +1699,7 @@ Concrete data from a real migration (the `nexus` parser generator, 0.15.2 → 0.
 
 ##### Three handling strategies
 
-1. **`init.arena.allocator()` at the top of `main()`.** Best choice for **short-lived CLIs**: read input, compute, emit output, exit. Nexus, code generators, grammar compilers, most build-time tools fit this shape. Arena has zero leak-tracking overhead and individual `.free()` calls become harmless no-ops. Silences both surprises.
+1. **`init.arena.allocator()` at the top of `main()`.** Best choice for **short-lived CLIs**: read input, compute, emit output, exit. Code generators, grammar compilers, most build-time tools fit this shape. Arena has zero leak-tracking overhead and individual `.free()` calls become harmless no-ops. Silences both surprises.
 
    ```zig
    pub fn main(init: std.process.Init) !void {
