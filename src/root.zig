@@ -155,6 +155,22 @@ pub const Color = @import("highlight.zig").Color;
 pub const WidthPolicy = @import("grapheme.zig").WidthPolicy;
 
 // =============================================================================
+// Application wake-up hook
+// =============================================================================
+//
+// The active editor's input layer polls on `{tty, signal_pipe}`. The
+// signal pipe is normally fed by zigline's own SIGWINCH/SIGTSTP/SIGCONT
+// handlers; this hook lets the embedding application synthesize a wake
+// from its own signal handlers (e.g., a shell installing a SIGCHLD
+// handler that needs to interrupt the editor's blocked `read()` so the
+// next render reflects newly-completed background jobs).
+//
+// Async-signal-safe: writes a single byte to the active editor's pipe
+// via `std.c.write`. No-op when no editor is currently active.
+
+pub const pokeActiveSignalPipe = @import("terminal.zig").pokeActiveSignalPipe;
+
+// =============================================================================
 // Test discovery — every per-module test block runs through `zig build test`
 // =============================================================================
 
