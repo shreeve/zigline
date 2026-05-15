@@ -132,6 +132,16 @@ Items in `FUTURE.md` not on this list are post-v1.0.
 
 ## Recent additions
 
+- **post-v0.4.0 — `CustomActionResult.replace_buffer_and_accept`.**
+  New variant for atomic "replace buffer and submit" custom actions
+  (e.g. abbreviation expansion on Enter). Validates UTF-8 + control
+  bytes like `replace_buffer`, repaints the replacement WITHOUT a
+  ghost-text hint so the visible terminal transcript matches the
+  accepted line, then accepts via the same path as `accept_line`
+  (history-append included). Hint cache is also cleared at the top
+  of `acceptCurrentLine` / `cancelCurrentLine` for forward-
+  compatibility with future async edit paths.
+
 - **post-v0.3.1 — Ghost-text hint hook (`Options.hint`) + `Action.accept_hint`.**
   New public surface in `src/hint.zig` (`HintHook`, `HintRequest`,
   `HintResult`) re-exported from `root.zig`. `HintResult.style` is

@@ -711,3 +711,27 @@ test "pty: multi-key chord (Ctrl-X Ctrl-U) dispatches the bound action" {
     // into the buffer.
     try std.testing.expect(std.mem.indexOf(u8, r.out, "got: hellox") == null);
 }
+
+test "pty: replace_buffer_and_accept (Ctrl-X Ctrl-A) atomically expands and submits" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // with_custom_action binds Ctrl-X Ctrl-A to a hook that prefixes
+    // the buffer with "expanded: " and returns
+    // `replace_buffer_and_accept`. The accepted line printed by the
+    // example must be the expansion, not the original abbreviation.
+    // Models the Slash `str`-on-Enter abbreviation pattern.
+    const r = try runScriptOn(alloc, "zig-out/bin/with_custom_action", &.{}, &.{
+        .{ .send = "abbr\x18\x01" }, // type "abbr" + Ctrl-X + Ctrl-A
+        .{ .send = "\x04", .settle_ms = 200 },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    // The accepted line surfaced by `readLine` is the expansion. The
+    // example prints `got: <line>\n` after each accept.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: expanded: abbr") != null);
+    // Sanity: should NOT have submitted the unexpanded abbreviation
+    // alone (would imply we hit accept_line on the original buffer
+    // instead of the replacement-and-accept path).
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: abbr\r\n") == null);
+}

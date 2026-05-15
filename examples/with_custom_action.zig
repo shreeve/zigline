@@ -1,6 +1,6 @@
 //! zigline example: application-defined custom actions.
 //!
-//! Three bindings are added beyond the emacs defaults:
+//! Four bindings are added beyond the emacs defaults:
 //!
 //!   `Ctrl-T`           uppercase the current buffer in place
 //!                      (single-key; via the legacy `lookupFn`)
@@ -8,6 +8,11 @@
 //!                      (binding-table; same action as Ctrl-T)
 //!   `Ctrl-X Ctrl-E`    open the buffer in `$EDITOR` (vi if unset)
 //!                      (binding-table; the canonical bash chord)
+//!   `Ctrl-X Ctrl-A`    prefix the buffer with `expanded: ` AND
+//!                      submit it as the accepted line atomically
+//!                      (binding-table; demonstrates
+//!                      `replace_buffer_and_accept` for app-side
+//!                      abbreviation expansion on Enter)
 //!
 //! The first demonstrates a pure-buffer transform via single-key
 //! `lookupFn`. The second and third demonstrate the `BindingTable`
@@ -15,7 +20,10 @@
 //! conventions). Ctrl-X Ctrl-E is the canonical "edit-in-EDITOR"
 //! pattern: the hook pauses raw mode, spawns the editor, reads the
 //! result back, then returns `replace_buffer` so the new contents
-//! become the line.
+//! become the line. Ctrl-X Ctrl-A demonstrates the atomic
+//! replace+accept variant — the visible terminal transcript shows
+//! the expansion before CRLF, and `readLine` returns the
+//! expansion as the accepted line in one event.
 //!
 //! Build and run:
 //!   zig build run-with_custom_action
@@ -31,6 +39,7 @@ extern fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 const ActionId = enum(u32) {
     uppercase = 1,
     edit_in_editor = 2,
+    expand_and_accept = 3,
 };
 
 /// Single-key bindings get the legacy lookupFn; multi-key sequences
@@ -63,6 +72,19 @@ fn customAction(
             break :blk .{ .replace_buffer = upper };
         },
         .edit_in_editor => editInEditor(allocator, request, action_ctx),
+        .expand_and_accept => blk: {
+            // Prefix the existing buffer with "expanded: " and submit
+            // the result atomically. Models a Slash-style abbreviation
+            // expansion that fires on Enter: user types `str`, the
+            // hook returns the full expansion, the line is accepted
+            // in one editor event with the expansion visible in the
+            // terminal transcript.
+            const prefix = "expanded: ";
+            const out = try allocator.alloc(u8, prefix.len + request.buffer.len);
+            @memcpy(out[0..prefix.len], prefix);
+            @memcpy(out[prefix.len..], request.buffer);
+            break :blk .{ .replace_buffer_and_accept = out };
+        },
     };
 }
 
@@ -156,8 +178,10 @@ pub fn main(init: std.process.Init) !u8 {
     const ctrl_x = zigline.KeyEvent{ .code = .{ .char = 'x' }, .mods = .{ .ctrl = true } };
     const ctrl_e = zigline.KeyEvent{ .code = .{ .char = 'e' }, .mods = .{ .ctrl = true } };
     const ctrl_u = zigline.KeyEvent{ .code = .{ .char = 'u' }, .mods = .{ .ctrl = true } };
+    const ctrl_a = zigline.KeyEvent{ .code = .{ .char = 'a' }, .mods = .{ .ctrl = true } };
     _ = try bindings.bind(&[_]zigline.KeyEvent{ ctrl_x, ctrl_e }, .{ .custom = @intFromEnum(ActionId.edit_in_editor) });
     _ = try bindings.bind(&[_]zigline.KeyEvent{ ctrl_x, ctrl_u }, .{ .custom = @intFromEnum(ActionId.uppercase) });
+    _ = try bindings.bind(&[_]zigline.KeyEvent{ ctrl_x, ctrl_a }, .{ .custom = @intFromEnum(ActionId.expand_and_accept) });
 
     var editor = try zigline.Editor.init(alloc, .{
         .keymap = .{

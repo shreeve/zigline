@@ -217,6 +217,21 @@ pub const CustomActionResult = union(enum) {
     /// Recorded as a single `Replace` undo op so one Ctrl-_
     /// unwinds. Allocator-owned; editor frees after applying.
     replace_buffer: []const u8,
+    /// Replace the entire buffer with `text` AND submit the result
+    /// as the accepted line in one atomic step. The editor
+    /// validates `text` (UTF-8 + no control bytes), replaces the
+    /// buffer, repaints the rendered frame WITHOUT a ghost-text
+    /// hint (so the visible terminal transcript shows the
+    /// replacement, not the pre-action buffer, before CRLF), then
+    /// returns `.line = text`. History append matches a normal
+    /// `accept_line`. On invalid text the editor reports a
+    /// diagnostic, leaves the buffer untouched, and does NOT
+    /// accept (returns null from the action arm so the next
+    /// `readLine` iteration runs). Allocator-owned; editor frees
+    /// after applying. Unlike `replace_buffer` no undo step is
+    /// recorded — the line is consumed immediately so undo would
+    /// be unobservable.
+    replace_buffer_and_accept: []const u8,
     /// Submit the current buffer as the accepted line.
     accept_line,
     /// Discard the current buffer; surface `interrupt` to caller.
@@ -558,6 +573,23 @@ pub const Editor = struct {
     // -------------------------------------------------------------------------
 
     fn render(self: *Editor, prompt: prompt_mod.Prompt) !void {
+        return self.renderInternal(prompt, true);
+    }
+
+    /// Render the prompt + buffer + (optional hint) frame.
+    ///
+    /// `with_hint = false` is used by paths that have just mutated
+    /// the buffer and are about to finalize/accept (currently:
+    /// `replace_buffer_and_accept`). Suppressing the hook prevents a
+    /// one-frame flash of ghost text against the soon-to-be-accepted
+    /// line and guarantees the cache is empty before
+    /// `acceptCurrentLine` runs, so an `accept_hint` racing the
+    /// finalize cannot consume stale bytes.
+    fn renderInternal(
+        self: *Editor,
+        prompt: prompt_mod.Prompt,
+        with_hint: bool,
+    ) !void {
         var span_buf: ?[]highlight_mod.HighlightSpan = null;
         defer if (span_buf) |sb| self.allocator.free(sb);
 
@@ -574,7 +606,10 @@ pub const Editor = struct {
                 self.diag(.{ .kind = .highlight_hook_failed, .err = err });
             }
         }
-        const draw = self.computeHintDraw();
+        const draw: ?renderer_mod.HintDraw = if (with_hint) self.computeHintDraw() else blk: {
+            self.clearHintCache();
+            break :blk null;
+        };
         try self.renderer.render(&self.terminal, prompt, &self.buffer, spans, draw);
     }
 
@@ -876,7 +911,11 @@ pub const Editor = struct {
         }
     }
 
-    fn handleCustomAction(self: *Editor, id: u32) !?ReadLineResult {
+    fn handleCustomAction(
+        self: *Editor,
+        id: u32,
+        prompt: prompt_mod.Prompt,
+    ) !?ReadLineResult {
         const hook = self.options.custom_action orelse return null;
         const result = hook.invokeFn(
             hook.ctx,
@@ -930,6 +969,28 @@ pub const Editor = struct {
                 self.changeset.breakSequence();
                 return null;
             },
+            .replace_buffer_and_accept => |t| {
+                defer self.allocator.free(t);
+                if (!std.unicode.utf8ValidateSlice(t)) {
+                    self.diag(.{ .kind = .custom_action_invalid_text, .detail = "custom_action replace_buffer_and_accept not UTF-8" });
+                    return null;
+                }
+                if (buffer_mod.findUnsafeByte(t) != null) {
+                    self.diag(.{ .kind = .custom_action_invalid_text, .detail = "custom_action replace_buffer_and_accept contains control bytes" });
+                    return null;
+                }
+                // Replace the buffer so the visible terminal transcript
+                // matches what the caller will receive from `readLine`.
+                // Repaint with `with_hint = false` — the hint hook would
+                // otherwise see the just-substituted text and might
+                // surface a fresh ghost suffix that flashes against the
+                // soon-to-be-accepted line. No undo record: the line is
+                // consumed immediately by `acceptCurrentLine`, which
+                // clears the changeset.
+                try self.buffer.replaceAll(t);
+                try self.renderInternal(prompt, false);
+                return try self.acceptCurrentLine();
+            },
             .accept_line => return try self.acceptCurrentLine(),
             .cancel_line => return try self.cancelCurrentLine(),
         }
@@ -939,6 +1000,11 @@ pub const Editor = struct {
     /// history. Shared between the `.accept_line` action arm and the
     /// custom-action `.accept_line` result variant.
     fn acceptCurrentLine(self: *Editor) !ReadLineResult {
+        // Drop any cached hint snapshot before the buffer is taken;
+        // a stale cache would never match the next render's buffer
+        // anyway, but freeing here keeps the field's lifetime tied
+        // to the line that produced it.
+        self.clearHintCache();
         try self.renderer.finalize(&self.terminal);
         const out = try self.buffer.take();
         self.changeset.clear();
@@ -956,6 +1022,7 @@ pub const Editor = struct {
     /// between the `.cancel_line` action arm and the custom-action
     /// `.cancel_line` result variant.
     fn cancelCurrentLine(self: *Editor) !ReadLineResult {
+        self.clearHintCache();
         try self.renderer.finalize(&self.terminal);
         if (self.options.raw_mode != .disabled and self.terminal.isInputTty()) {
             self.terminal.writeAll("^C\r\n") catch {};
@@ -1305,7 +1372,7 @@ pub const Editor = struct {
                 self.renderer.markFresh();
                 _ = std.c.raise(.TSTP);
             },
-            .custom => |id| return try self.handleCustomAction(id),
+            .custom => |id| return try self.handleCustomAction(id, prompt),
         }
         return null;
     }
@@ -1908,6 +1975,20 @@ test "editor: invalid candidate UTF-8 fires diagnostic, leaves buffer untouched"
     try std.testing.expectEqualStrings("hi", editor.buffer.slice());
 }
 
+// Open /dev/null for write, used by tests that exercise paths
+// which write escape sequences or `\r\n` to `output_fd` (e.g.
+// `acceptCurrentLine` calling `renderer.finalize`, or
+// `replace_buffer_and_accept` calling `renderInternal`). Under
+// `zig build test --listen=-` the test binary's stdin/stdout are
+// the IPC channel with the build runner; spurious bytes corrupt
+// that protocol and can deadlock the runner. Routing the editor's
+// terminal writes to `/dev/null` keeps the channel clean while
+// still exercising the production code paths.
+fn openDevNullForWrite() std.posix.fd_t {
+    const fd = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+    return @intCast(fd);
+}
+
 // Test plumbing: a per-test callback context. Tests provide the
 // next result they want returned; the callback dupes any text via
 // the editor-supplied allocator (the editor frees after applying).
@@ -1935,6 +2016,7 @@ fn caTestCb(
     return switch (self.next) {
         .insert_text => |t| CustomActionResult{ .insert_text = try allocator.dupe(u8, t) },
         .replace_buffer => |t| CustomActionResult{ .replace_buffer = try allocator.dupe(u8, t) },
+        .replace_buffer_and_accept => |t| CustomActionResult{ .replace_buffer_and_accept = try allocator.dupe(u8, t) },
         .no_op => .no_op,
         .accept_line => .accept_line,
         .cancel_line => .cancel_line,
@@ -1955,7 +2037,7 @@ test "editor: custom action no_op invokes hook with correct snapshot" {
 
     try editor.buffer.insertText("foobar");
     editor.buffer.cursor_byte = 3;
-    _ = try editor.handleCustomAction(42);
+    _ = try editor.handleCustomAction(42, prompt_mod.Prompt.plain(""));
 
     try std.testing.expect(ctx.invoked);
     try std.testing.expectEqual(@as(u32, 42), ctx.last_id);
@@ -1975,7 +2057,7 @@ test "editor: custom action insert_text inserts at cursor" {
     try editor.buffer.insertText("abcd");
     editor.buffer.cursor_byte = 2;
     editor.changeset.breakSequence();
-    _ = try editor.handleCustomAction(0);
+    _ = try editor.handleCustomAction(0, prompt_mod.Prompt.plain(""));
 
     try std.testing.expectEqualStrings("abINScd", editor.buffer.slice());
     try std.testing.expect(editor.changeset.canUndo());
@@ -1991,7 +2073,7 @@ test "editor: custom action replace_buffer swaps via single Replace op" {
 
     try editor.buffer.insertText("stale");
     editor.changeset.breakSequence();
-    _ = try editor.handleCustomAction(0);
+    _ = try editor.handleCustomAction(0, prompt_mod.Prompt.plain(""));
 
     try std.testing.expectEqualStrings("fresh", editor.buffer.slice());
     const op = editor.changeset.peekUndo().?;
@@ -2009,22 +2091,25 @@ test "editor: custom action rejects invalid UTF-8 in insert_text" {
     defer editor.deinit();
 
     try editor.buffer.insertText("hello");
-    _ = try editor.handleCustomAction(0);
+    _ = try editor.handleCustomAction(0, prompt_mod.Prompt.plain(""));
 
     try std.testing.expectEqualStrings("hello", editor.buffer.slice());
     try std.testing.expect(diag_ctx.count >= 1);
 }
 
 test "editor: custom action accept_line surfaces buffer as line" {
+    const dev_null = openDevNullForWrite();
+    defer _ = std.c.close(dev_null);
     var ctx: CATestCtx = .{ .next = .accept_line };
     var editor = try Editor.init(std.testing.allocator, .{
         .raw_mode = .disabled,
+        .output_fd = dev_null,
         .custom_action = caHook(&ctx),
     });
     defer editor.deinit();
 
     try editor.buffer.insertText("submitted");
-    const result = try editor.handleCustomAction(0);
+    const result = try editor.handleCustomAction(0, prompt_mod.Prompt.plain(""));
     try std.testing.expect(result != null);
     switch (result.?) {
         .line => |line| {
@@ -2036,19 +2121,149 @@ test "editor: custom action accept_line surfaces buffer as line" {
 }
 
 test "editor: custom action cancel_line returns interrupt + clears state" {
+    const dev_null = openDevNullForWrite();
+    defer _ = std.c.close(dev_null);
     var ctx: CATestCtx = .{ .next = .cancel_line };
     var editor = try Editor.init(std.testing.allocator, .{
         .raw_mode = .disabled,
+        .output_fd = dev_null,
         .custom_action = caHook(&ctx),
     });
     defer editor.deinit();
 
     try editor.buffer.insertText("discarded");
-    const result = try editor.handleCustomAction(0);
+    const result = try editor.handleCustomAction(0, prompt_mod.Prompt.plain(""));
     try std.testing.expect(result != null);
     try std.testing.expect(result.? == .interrupt);
     try std.testing.expectEqualStrings("", editor.buffer.slice());
     try std.testing.expect(!editor.changeset.canUndo());
+}
+
+test "editor: replace_buffer_and_accept returns expansion as accepted line" {
+    const dev_null = openDevNullForWrite();
+    defer _ = std.c.close(dev_null);
+    var ctx: CATestCtx = .{ .next = .{ .replace_buffer_and_accept = "expanded command" } };
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .output_fd = dev_null,
+        .custom_action = caHook(&ctx),
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("str");
+    const result = try editor.handleCustomAction(0, prompt_mod.Prompt.plain(""));
+    try std.testing.expect(result != null);
+    switch (result.?) {
+        .line => |line| {
+            defer std.testing.allocator.free(line);
+            try std.testing.expectEqualStrings("expanded command", line);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // Buffer is consumed by `take()` inside acceptCurrentLine; the
+    // editor's buffer is empty afterward.
+    try std.testing.expectEqualStrings("", editor.buffer.slice());
+}
+
+test "editor: replace_buffer_and_accept appends to history when attached" {
+    const dev_null = openDevNullForWrite();
+    defer _ = std.c.close(dev_null);
+    var hist = try history_mod.History.init(std.testing.allocator, .{});
+    defer hist.deinit();
+
+    var ctx: CATestCtx = .{ .next = .{ .replace_buffer_and_accept = "ls -la" } };
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .output_fd = dev_null,
+        .custom_action = caHook(&ctx),
+        .history = &hist,
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("ls");
+    const result = try editor.handleCustomAction(0, prompt_mod.Prompt.plain(""));
+    try std.testing.expect(result != null);
+    switch (result.?) {
+        .line => |line| {
+            defer std.testing.allocator.free(line);
+            try std.testing.expectEqualStrings("ls -la", line);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), hist.entryCount());
+    try std.testing.expectEqualStrings("ls -la", hist.entryAt(0).?);
+}
+
+test "editor: replace_buffer_and_accept with empty text accepts empty line, no history" {
+    const dev_null = openDevNullForWrite();
+    defer _ = std.c.close(dev_null);
+    var hist = try history_mod.History.init(std.testing.allocator, .{});
+    defer hist.deinit();
+
+    var ctx: CATestCtx = .{ .next = .{ .replace_buffer_and_accept = "" } };
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .output_fd = dev_null,
+        .custom_action = caHook(&ctx),
+        .history = &hist,
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("anything");
+    const result = try editor.handleCustomAction(0, prompt_mod.Prompt.plain(""));
+    try std.testing.expect(result != null);
+    switch (result.?) {
+        .line => |line| {
+            defer std.testing.allocator.free(line);
+            try std.testing.expectEqualStrings("", line);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // Empty line is not appended to history (matches normal accept_line).
+    try std.testing.expectEqual(@as(usize, 0), hist.entryCount());
+}
+
+test "editor: replace_buffer_and_accept rejects invalid UTF-8 nonfatally" {
+    var ctx: CATestCtx = .{ .next = .{ .replace_buffer_and_accept = "\xFF\xFE" } };
+    var diag: DiagTestCtx = .{};
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .custom_action = caHook(&ctx),
+        .diagnostic = diag.hook(),
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("safe");
+    const result = try editor.handleCustomAction(0, prompt_mod.Prompt.plain(""));
+    // Action did not accept; original buffer preserved.
+    try std.testing.expect(result == null);
+    try std.testing.expectEqualStrings("safe", editor.buffer.slice());
+    try std.testing.expect(diag.count >= 1);
+    try std.testing.expectEqual(
+        @as(?Diagnostic.Kind, .custom_action_invalid_text),
+        diag.last_kind,
+    );
+}
+
+test "editor: replace_buffer_and_accept rejects control bytes nonfatally" {
+    var ctx: CATestCtx = .{ .next = .{ .replace_buffer_and_accept = "okay\x1bbad" } };
+    var diag: DiagTestCtx = .{};
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .custom_action = caHook(&ctx),
+        .diagnostic = diag.hook(),
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("safe");
+    const result = try editor.handleCustomAction(0, prompt_mod.Prompt.plain(""));
+    try std.testing.expect(result == null);
+    try std.testing.expectEqualStrings("safe", editor.buffer.slice());
+    try std.testing.expect(diag.count >= 1);
+    try std.testing.expectEqual(
+        @as(?Diagnostic.Kind, .custom_action_invalid_text),
+        diag.last_kind,
+    );
 }
 
 const WCMCtx = struct {
