@@ -339,9 +339,16 @@ pub const Editor = struct {
     /// with len > 1), falls through as singleton (`.none` with len
     /// 1), or `readLine` enters / exits. See SPEC §5.2.
     pending_keys: std.ArrayListUnmanaged(input_mod.KeyEvent) = .empty,
+    /// True iff this editor won the process-wide claim for
+    /// `terminal_mod.pokeActiveFreshRow` in `init`. Tracked per-
+    /// instance so a non-owner with the same fd cannot release the
+    /// owner's claim in `deinit`. First `Editor.init` wins; later
+    /// editors silently lose the global claim (their own
+    /// `ensureFreshRow` instance method still works deterministically).
+    fresh_row_claimed: bool = false,
 
     pub fn init(allocator: Allocator, options: Options) !Editor {
-        return .{
+        var editor: Editor = .{
             .allocator = allocator,
             .options = options,
             .buffer = blk: {
@@ -355,9 +362,22 @@ pub const Editor = struct {
             .kill_ring = kill_ring_mod.KillRing.init(allocator, options.kill_ring_capacity),
             .changeset = undo_mod.Changeset.init(allocator),
         };
+        // Claim is the last init step and is best-effort, so no
+        // errdefer is required today. If future init steps after this
+        // one can fail, add an errdefer that calls
+        // `terminal_mod.releaseEditorOutputFd(options.output_fd)`
+        // gated on `editor.fresh_row_claimed`.
+        if (terminal_mod.tryClaimEditorOutputFd(options.output_fd)) {
+            editor.fresh_row_claimed = true;
+        }
+        return editor;
     }
 
     pub fn deinit(self: *Editor) void {
+        if (self.fresh_row_claimed) {
+            terminal_mod.releaseEditorOutputFd(self.terminal.output_fd);
+            self.fresh_row_claimed = false;
+        }
         self.buffer.deinit();
         self.renderer.deinit();
         self.reader.deinit();
@@ -463,15 +483,28 @@ pub const Editor = struct {
         terminal_mod.pokeActiveSignalPipe();
     }
 
-    /// Convenience wrapper around `terminal_mod.pokeActiveFreshRow`
-    /// for callers that hold an `Editor` instance. Same semantics:
-    /// writes `\r\n` to the active output fd so the next render
-    /// starts at column 0 of a fresh row, preserving any external
-    /// content emitted to the tty between `readLine` calls (e.g.
-    /// kernel-echoed `^C` from a Ctrl-C'd foreground job).
+    /// Push the cursor to a fresh row before this editor's next
+    /// render. Call between `readLine` invocations when the embedding
+    /// application has emitted text to the tty whose cursor position
+    /// is uncertain — e.g., after a foreground job died via signal
+    /// (the kernel may have echoed `^C` to the prompt row, and the
+    /// editor's render-on-readLine would otherwise clear that row
+    /// before the user sees it).
+    ///
+    /// Writes `\r\n` directly to this editor's `output_fd` (via
+    /// `Terminal.writeAll`'s retry loop). Unlike the standalone
+    /// `terminal_mod.pokeActiveFreshRow`, this method does NOT
+    /// depend on a process-global claim and is therefore reliable
+    /// in multi-editor processes — the standalone variant only
+    /// fires for the first-init'd editor.
+    ///
+    /// Best-effort: ignores write errors. Only emits CRLF — does
+    /// NOT invalidate an in-flight render or update cached cursor
+    /// state, so it's safe ONLY between `readLine` calls (the next
+    /// `readLine` calls `markFresh` on the renderer). Not async-
+    /// signal-safe; never call from a signal handler.
     pub fn ensureFreshRow(self: *Editor) void {
-        _ = self;
-        terminal_mod.pokeActiveFreshRow();
+        self.terminal.writeAll("\r\n") catch {};
     }
 
     // -------------------------------------------------------------------------
@@ -2304,4 +2337,117 @@ test "editor: sanitizePaste replaces invalid UTF-8 with FFFD" {
     const got = try sanitizePaste(std.testing.allocator, "a\xC3 b");
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("a\xEF\xBF\xBD b", got);
+}
+
+// -----------------------------------------------------------------------------
+// Fresh-row hook lifecycle tests — the v0.3.0 implementation tied the
+// claim to SignalGuard (raw-mode-scoped) and was a no-op in the
+// default config; v0.3.1 moves the claim to Editor.init/deinit. These
+// tests exercise the real lifecycle the embedder sees, not the bare
+// atomic primitive (which is covered in terminal.zig).
+// -----------------------------------------------------------------------------
+
+test "editor: init claims and deinit releases the active editor output fd" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expect(std.c.pipe(&fds) == 0);
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .input_fd = fds[0],
+        .output_fd = fds[1],
+    });
+    try std.testing.expect(editor.fresh_row_claimed);
+
+    // Standalone hook fires for our pipe.
+    terminal_mod.pokeActiveFreshRow();
+    var buf: [4]u8 = undefined;
+    const n = std.c.read(fds[0], &buf, buf.len);
+    try std.testing.expectEqual(@as(isize, 2), n);
+    try std.testing.expectEqualSlices(u8, "\r\n", buf[0..2]);
+
+    editor.deinit();
+
+    // After deinit, no editor is registered and the standalone hook
+    // is a no-op. Verify by setting the read end nonblocking and
+    // confirming nothing arrives. Assert both fcntl calls succeed —
+    // a failed SETFL would silently turn the EAGAIN check below into
+    // a hang.
+    const o_nonblock: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+    const flags = std.c.fcntl(fds[0], std.c.F.GETFL, @as(c_int, 0));
+    try std.testing.expect(flags >= 0);
+    try std.testing.expect(std.c.fcntl(fds[0], std.c.F.SETFL, flags | o_nonblock) >= 0);
+    terminal_mod.pokeActiveFreshRow();
+    const m = std.c.read(fds[0], &buf, buf.len);
+    try std.testing.expect(m < 0);
+    try std.testing.expectEqual(std.c.errno(@as(c_int, -1)), std.c.E.AGAIN);
+}
+
+test "editor: ensureFreshRow writes CRLF directly to this editor's output fd" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expect(std.c.pipe(&fds) == 0);
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .input_fd = fds[0],
+        .output_fd = fds[1],
+    });
+    defer editor.deinit();
+
+    editor.ensureFreshRow();
+    var buf: [4]u8 = undefined;
+    const n = std.c.read(fds[0], &buf, buf.len);
+    try std.testing.expectEqual(@as(isize, 2), n);
+    try std.testing.expectEqualSlices(u8, "\r\n", buf[0..2]);
+}
+
+test "editor: second Editor.init does not steal the global claim from the first" {
+    var fds_a: [2]c_int = undefined;
+    var fds_b: [2]c_int = undefined;
+    try std.testing.expect(std.c.pipe(&fds_a) == 0);
+    try std.testing.expect(std.c.pipe(&fds_b) == 0);
+    defer {
+        _ = std.c.close(fds_a[0]);
+        _ = std.c.close(fds_a[1]);
+        _ = std.c.close(fds_b[0]);
+        _ = std.c.close(fds_b[1]);
+    }
+
+    var ed_a = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .input_fd = fds_a[0],
+        .output_fd = fds_a[1],
+    });
+    defer ed_a.deinit();
+    try std.testing.expect(ed_a.fresh_row_claimed);
+
+    var ed_b = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .input_fd = fds_b[0],
+        .output_fd = fds_b[1],
+    });
+    defer ed_b.deinit();
+    // Second editor silently loses the global claim.
+    try std.testing.expect(!ed_b.fresh_row_claimed);
+
+    // Standalone hook still routes to A.
+    terminal_mod.pokeActiveFreshRow();
+    var buf: [4]u8 = undefined;
+    const n_a = std.c.read(fds_a[0], &buf, buf.len);
+    try std.testing.expectEqual(@as(isize, 2), n_a);
+    try std.testing.expectEqualSlices(u8, "\r\n", buf[0..2]);
+
+    // B's instance method still works deterministically against B's fd,
+    // independent of who holds the global claim.
+    ed_b.ensureFreshRow();
+    const n_b = std.c.read(fds_b[0], &buf, buf.len);
+    try std.testing.expectEqual(@as(isize, 2), n_b);
+    try std.testing.expectEqualSlices(u8, "\r\n", buf[0..2]);
 }

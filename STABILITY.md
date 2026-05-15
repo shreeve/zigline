@@ -128,3 +128,17 @@ shipped:
    regressions.
 
 Items in `FUTURE.md` not on this list are post-v1.0.
+
+## Known issues
+
+- **v0.3.0 — `pokeActiveFreshRow` is a no-op in the default config.**
+  The initial implementation tied the process-wide claim to
+  `SignalGuard`, which lives only between `enterRawMode` and
+  `leaveRawMode`. In the default `.enter_and_leave` raw-mode policy
+  the claim is therefore cleared by the time the embedder calls the
+  hook *between* `readLine` invocations — exactly when it's needed.
+  Under `.assume_raw` the SignalGuard is never installed at all, so
+  the claim is never set. Fixed in v0.3.1 by moving the claim to
+  `Editor.init` / `Editor.deinit` (lifetime = "an editor instance is
+  alive"), which is what the contract advertised. Embedders on
+  v0.3.0 should upgrade; the public API surface is unchanged.

@@ -155,28 +155,51 @@ pub const Color = @import("highlight.zig").Color;
 pub const WidthPolicy = @import("grapheme.zig").WidthPolicy;
 
 // =============================================================================
-// Application wake-up hook
+// Wake-up hook (signal-handler-safe; in-flight `readLine` only)
 // =============================================================================
-//
-// The active editor's input layer polls on `{tty, signal_pipe}`. The
-// signal pipe is normally fed by zigline's own SIGWINCH/SIGTSTP/SIGCONT
-// handlers; this hook lets the embedding application synthesize a wake
-// from its own signal handlers (e.g., a shell installing a SIGCHLD
-// handler that needs to interrupt the editor's blocked `read()` so the
-// next render reflects newly-completed background jobs).
-//
-// Async-signal-safe: writes a single byte to the active editor's pipe
-// via `std.c.write`. No-op when no editor is currently active.
 
+/// Wake the active editor's blocked `read()` from a signal handler.
+/// The active editor's input layer polls on `{tty, signal_pipe}`;
+/// this writes one byte to the signal pipe so the read returns and
+/// the next render picks up application-side state changes (e.g.,
+/// a shell's SIGCHLD handler that wants the next render to reflect
+/// newly-completed background jobs).
+///
+/// Lifetime: useful only while an editor is actively blocked inside
+/// `readLine`. The signal pipe is owned by `SignalGuard`, which
+/// exists only between `enterRawMode` and `leaveRawMode` — so this
+/// is a no-op between `readLine` calls. For SIGWINCH that's fine
+/// (no read = nothing to wake); SIGCHLD handlers should also
+/// update their own application state so the next `readLine`
+/// renders correctly even if the wake itself was a no-op.
+///
+/// Async-signal-safe: a single one-byte `std.c.write` to a non-
+/// blocking pipe. Safe to call from a signal handler.
 pub const pokeActiveSignalPipe = @import("terminal.zig").pokeActiveSignalPipe;
 
-// Push the active editor's cursor to a fresh row before the next
-// render. Call between `readLine` invocations after the embedding
-// application has emitted external content to the tty whose cursor
-// position is uncertain (e.g., a kernel-echoed `^C` from a signaled
-// foreground job). Writes `\r\n` to the active output fd; no-op
-// when no editor is currently active.
+// =============================================================================
+// Row hygiene hook (NOT signal-safe; between `readLine` calls)
+// =============================================================================
 
+/// Push the registered editor's cursor to a fresh row before the
+/// next render. Call between `readLine` invocations when the
+/// embedding application has emitted external content to the tty
+/// whose cursor position is uncertain — e.g., a kernel-echoed `^C`
+/// after a Ctrl-C'd foreground job. Without this, the next
+/// `readLine`'s clear-line-and-redraw would wipe that content
+/// from the user's view.
+///
+/// Lifetime: targets a process-global "registered editor" claim
+/// taken in `Editor.init` and released in `Editor.deinit` (first-
+/// init wins). No-op when no `Editor` instance exists in this
+/// process. For multi-editor processes the deterministic
+/// alternative is `Editor.ensureFreshRow()` on the specific
+/// instance — that method writes to the editor's own output fd
+/// directly and never depends on the global claim.
+///
+/// Best-effort: writes `\r\n` with a small retry loop. NOT async-
+/// signal-safe — terminal output can block on flow control. Call
+/// from normal application control flow only.
 pub const pokeActiveFreshRow = @import("terminal.zig").pokeActiveFreshRow;
 
 // =============================================================================

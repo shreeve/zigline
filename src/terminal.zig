@@ -29,11 +29,28 @@ pub const PipeSignal = struct {
 /// sigactions. Only one `SignalGuard` may be active at a time —
 /// the atomic write-end FD is the claim. While zero, no editor
 /// owns signals; signal handlers are no-ops.
+///
+/// `active_output_fd` here is **SignalGuard-scoped** — populated by
+/// `SignalGuard.install` and cleared by `SignalGuard.uninstall`,
+/// i.e. only valid while raw mode is held. SIGTSTP/SIGCONT need
+/// "an output fd known to be in raw mode," which is exactly this
+/// lifetime. Do NOT read this from hooks that need to fire between
+/// `readLine` calls; use `active_editor_output_fd` (further below)
+/// instead.
 var active_pipe_write: std.atomic.Value(c_int) = .init(-1);
 var active_termios_saved: std.atomic.Value(?*const std.c.termios) = .init(null);
 var active_termios_raw: std.atomic.Value(?*const std.c.termios) = .init(null);
 var active_input_fd: std.atomic.Value(c_int) = .init(-1);
 var active_output_fd: std.atomic.Value(c_int) = .init(-1);
+
+/// **Editor-scoped** claim representing "an `Editor` instance is
+/// alive in this process and registered as the target of
+/// `pokeActiveFreshRow`." Set by `Editor.init` (first-claim-wins)
+/// and cleared by `Editor.deinit`. Distinct from `active_output_fd`
+/// above precisely because that one's lifetime is too narrow for
+/// between-`readLine` hooks. See `pokeActiveFreshRow` for the
+/// contract.
+var active_editor_output_fd: std.atomic.Value(c_int) = .init(-1);
 
 fn winchHandler(sig: std.c.SIG) callconv(.c) void {
     _ = sig;
@@ -237,7 +254,28 @@ pub fn pokeActiveSignalPipe() void {
     _ = std.c.write(fd, &b, 1);
 }
 
-/// Ensure the active editor's next render starts on a fresh row.
+/// Register `fd` as the process-wide editor output fd targeted by
+/// `pokeActiveFreshRow`. Called by `Editor.init`. Returns true on
+/// successful claim, false if another editor already holds it
+/// (first-claim-wins, by design — this hook is best-effort and we
+/// never want a convenience global to make `Editor.init` fail).
+/// The caller (Editor) tracks ownership in its own bool so a
+/// non-owner cannot release someone else's claim.
+pub fn tryClaimEditorOutputFd(fd: c_int) bool {
+    return active_editor_output_fd.cmpxchgStrong(-1, fd, .acq_rel, .acquire) == null;
+}
+
+/// Release a claim previously acquired via `tryClaimEditorOutputFd`.
+/// `cmpxchg(fd, -1)` avoids clearing a claim that's held against a
+/// DIFFERENT fd (i.e. a stale call after another editor took over).
+/// It cannot distinguish two editors that happen to share the same
+/// fd; same-fd ownership is enforced by the per-`Editor`
+/// `fresh_row_claimed` bool checked in `Editor.deinit`.
+pub fn releaseEditorOutputFd(fd: c_int) void {
+    _ = active_editor_output_fd.cmpxchgStrong(fd, -1, .acq_rel, .acquire);
+}
+
+/// Ensure the registered editor's next render starts on a fresh row.
 /// Call this between `readLine` invocations when the embedding
 /// application has emitted text to the tty whose cursor position
 /// is uncertain — e.g., after a foreground job died via signal
@@ -245,14 +283,38 @@ pub fn pokeActiveSignalPipe() void {
 /// editor's render-on-readLine would otherwise clear that row
 /// before the user sees it).
 ///
-/// Writes `\r\n` to the active editor's output fd. No-op when no
-/// editor is currently active. Idempotent ONLY in the sense that
-/// calling it twice produces two newlines; callers should call it
-/// at most once per "external content was emitted" event.
+/// Writes `\r\n` to the registered editor's output fd. The
+/// "registered" editor is the first `Editor.init` to win the
+/// process-wide claim — for processes that hold multiple editors,
+/// the deterministic alternative is `Editor.ensureFreshRow()` on
+/// the specific instance. No-op when no editor is currently
+/// registered (no `Editor` instance exists in this process, or the
+/// first one already deinit'd without a successor).
+///
+/// Best-effort: silently drops on partial-write failure (writing
+/// only `\r` would leave the cursor at column 0 on the SAME row,
+/// the exact bad state we're trying to avoid; the retry loop
+/// minimizes that window). Not async-signal-safe in contract —
+/// terminal output can block on flow control. Call from normal
+/// application control flow, never from a signal handler. (Use
+/// `pokeActiveSignalPipe` for that.)
 pub fn pokeActiveFreshRow() void {
-    const fd = active_output_fd.load(.acquire);
+    const fd = active_editor_output_fd.load(.acquire);
     if (fd < 0) return;
-    _ = std.c.write(fd, "\r\n", 2);
+    var off: usize = 0;
+    while (off < 2) {
+        const n = std.c.write(fd, "\r\n"[off..].ptr, 2 - off);
+        if (n < 0) {
+            // Retry only on EINTR. On EAGAIN (nonblocking fd not
+            // currently writable) we drop — busy-spinning here would
+            // hang the embedder, and this hook is best-effort void.
+            const e = std.c.errno(@as(c_int, -1));
+            if (e == .INTR) continue;
+            return;
+        }
+        if (n == 0) return;
+        off += @intCast(n);
+    }
 }
 
 pub const Terminal = struct {
@@ -429,7 +491,35 @@ test "terminal: init does not touch fds" {
     _ = t;
 }
 
-test "terminal: pokeActiveFreshRow writes CRLF to the active output fd" {
+test "terminal: tryClaimEditorOutputFd is first-claim-wins" {
+    try std.testing.expectEqual(@as(c_int, -1), active_editor_output_fd.load(.acquire));
+
+    try std.testing.expect(tryClaimEditorOutputFd(7));
+    defer releaseEditorOutputFd(7);
+    try std.testing.expectEqual(@as(c_int, 7), active_editor_output_fd.load(.acquire));
+
+    // Second editor with the same OR a different fd: claim must
+    // fail silently. The standalone hook keeps targeting the first
+    // claimant; the second editor's instance method still works.
+    try std.testing.expect(!tryClaimEditorOutputFd(7));
+    try std.testing.expect(!tryClaimEditorOutputFd(99));
+    try std.testing.expectEqual(@as(c_int, 7), active_editor_output_fd.load(.acquire));
+}
+
+test "terminal: releaseEditorOutputFd ignores non-owner fd" {
+    try std.testing.expectEqual(@as(c_int, -1), active_editor_output_fd.load(.acquire));
+
+    try std.testing.expect(tryClaimEditorOutputFd(11));
+    defer releaseEditorOutputFd(11);
+
+    // Non-owner with a different fd must not clear the slot.
+    releaseEditorOutputFd(99);
+    try std.testing.expectEqual(@as(c_int, 11), active_editor_output_fd.load(.acquire));
+}
+
+test "terminal: pokeActiveFreshRow writes CRLF to the registered fd" {
+    try std.testing.expectEqual(@as(c_int, -1), active_editor_output_fd.load(.acquire));
+
     var fds: [2]c_int = undefined;
     try std.testing.expect(std.c.pipe(&fds) == 0);
     defer {
@@ -437,10 +527,8 @@ test "terminal: pokeActiveFreshRow writes CRLF to the active output fd" {
         _ = std.c.close(fds[1]);
     }
 
-    // Stand in for `SignalGuard.install`'s claim — same atomic, same
-    // contract, no signal handlers needed for this hook's behavior.
-    active_output_fd.store(fds[1], .release);
-    defer active_output_fd.store(-1, .release);
+    try std.testing.expect(tryClaimEditorOutputFd(fds[1]));
+    defer releaseEditorOutputFd(fds[1]);
 
     pokeActiveFreshRow();
 
@@ -450,10 +538,29 @@ test "terminal: pokeActiveFreshRow writes CRLF to the active output fd" {
     try std.testing.expectEqualSlices(u8, "\r\n", buf[0..2]);
 }
 
-test "terminal: pokeActiveFreshRow is a no-op when no editor is active" {
-    // Sanity: with no claim, the call must not crash and must not
-    // touch any fd. We assert by confirming the global stays cleared.
-    try std.testing.expectEqual(@as(c_int, -1), active_output_fd.load(.acquire));
+test "terminal: pokeActiveFreshRow is a no-op when no editor is registered" {
+    try std.testing.expectEqual(@as(c_int, -1), active_editor_output_fd.load(.acquire));
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expect(std.c.pipe(&fds) == 0);
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+
+    // Make the read end nonblocking so we can verify "no bytes
+    // arrived" without deadlocking on an empty pipe. Assert both
+    // fcntl calls succeed — a failed SETFL would silently turn the
+    // assertion below into a hang.
+    const o_nonblock: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+    const flags = std.c.fcntl(fds[0], std.c.F.GETFL, @as(c_int, 0));
+    try std.testing.expect(flags >= 0);
+    try std.testing.expect(std.c.fcntl(fds[0], std.c.F.SETFL, flags | o_nonblock) >= 0);
+
     pokeActiveFreshRow();
-    try std.testing.expectEqual(@as(c_int, -1), active_output_fd.load(.acquire));
+
+    var buf: [4]u8 = undefined;
+    const n = std.c.read(fds[0], &buf, buf.len);
+    try std.testing.expect(n < 0);
+    try std.testing.expectEqual(std.c.errno(@as(c_int, -1)), std.c.E.AGAIN);
 }
