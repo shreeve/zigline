@@ -463,6 +463,17 @@ pub const Editor = struct {
         terminal_mod.pokeActiveSignalPipe();
     }
 
+    /// Convenience wrapper around `terminal_mod.pokeActiveFreshRow`
+    /// for callers that hold an `Editor` instance. Same semantics:
+    /// writes `\r\n` to the active output fd so the next render
+    /// starts at column 0 of a fresh row, preserving any external
+    /// content emitted to the tty between `readLine` calls (e.g.
+    /// kernel-echoed `^C` from a Ctrl-C'd foreground job).
+    pub fn ensureFreshRow(self: *Editor) void {
+        _ = self;
+        terminal_mod.pokeActiveFreshRow();
+    }
+
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------

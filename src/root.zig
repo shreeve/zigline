@@ -170,6 +170,15 @@ pub const WidthPolicy = @import("grapheme.zig").WidthPolicy;
 
 pub const pokeActiveSignalPipe = @import("terminal.zig").pokeActiveSignalPipe;
 
+// Push the active editor's cursor to a fresh row before the next
+// render. Call between `readLine` invocations after the embedding
+// application has emitted external content to the tty whose cursor
+// position is uncertain (e.g., a kernel-echoed `^C` from a signaled
+// foreground job). Writes `\r\n` to the active output fd; no-op
+// when no editor is currently active.
+
+pub const pokeActiveFreshRow = @import("terminal.zig").pokeActiveFreshRow;
+
 // =============================================================================
 // Test discovery — every per-module test block runs through `zig build test`
 // =============================================================================

@@ -237,6 +237,24 @@ pub fn pokeActiveSignalPipe() void {
     _ = std.c.write(fd, &b, 1);
 }
 
+/// Ensure the active editor's next render starts on a fresh row.
+/// Call this between `readLine` invocations when the embedding
+/// application has emitted text to the tty whose cursor position
+/// is uncertain — e.g., after a foreground job died via signal
+/// (the kernel may have echoed `^C` to the prompt row, and the
+/// editor's render-on-readLine would otherwise clear that row
+/// before the user sees it).
+///
+/// Writes `\r\n` to the active editor's output fd. No-op when no
+/// editor is currently active. Idempotent ONLY in the sense that
+/// calling it twice produces two newlines; callers should call it
+/// at most once per "external content was emitted" event.
+pub fn pokeActiveFreshRow() void {
+    const fd = active_output_fd.load(.acquire);
+    if (fd < 0) return;
+    _ = std.c.write(fd, "\r\n", 2);
+}
+
 pub const Terminal = struct {
     input_fd: std.posix.fd_t,
     output_fd: std.posix.fd_t,
@@ -409,4 +427,33 @@ pub const Terminal = struct {
 test "terminal: init does not touch fds" {
     const t = Terminal.init(0, 1);
     _ = t;
+}
+
+test "terminal: pokeActiveFreshRow writes CRLF to the active output fd" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expect(std.c.pipe(&fds) == 0);
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+
+    // Stand in for `SignalGuard.install`'s claim — same atomic, same
+    // contract, no signal handlers needed for this hook's behavior.
+    active_output_fd.store(fds[1], .release);
+    defer active_output_fd.store(-1, .release);
+
+    pokeActiveFreshRow();
+
+    var buf: [4]u8 = undefined;
+    const n = std.c.read(fds[0], &buf, buf.len);
+    try std.testing.expectEqual(@as(isize, 2), n);
+    try std.testing.expectEqualSlices(u8, "\r\n", buf[0..2]);
+}
+
+test "terminal: pokeActiveFreshRow is a no-op when no editor is active" {
+    // Sanity: with no claim, the call must not crash and must not
+    // touch any fd. We assert by confirming the global stays cleared.
+    try std.testing.expectEqual(@as(c_int, -1), active_output_fd.load(.acquire));
+    pokeActiveFreshRow();
+    try std.testing.expectEqual(@as(c_int, -1), active_output_fd.load(.acquire));
 }
