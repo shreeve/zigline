@@ -66,9 +66,10 @@ the cursor-navigation methods, `HistoryOptions` field set.
 **Hooks.**
 `CompletionHook`, `CompletionRequest`, `CompletionResult`, `Candidate`,
 `CandidateKind`. `HighlightHook`, `HighlightRequest`, `HighlightSpan`,
-`Style`, `Color`. `CustomActionHook`, `CustomActionRequest`,
-`CustomActionResult`, `CustomActionContext`. `DiagnosticHook` and
-`Diagnostic` struct shape.
+`Style`, `Color`. `HintHook`, `HintRequest`, `HintResult` (fish-style
+ghost-text autosuggestions, post-v0.3.x). `CustomActionHook`,
+`CustomActionRequest`, `CustomActionResult`, `CustomActionContext`.
+`DiagnosticHook` and `Diagnostic` struct shape.
 
 **Custom-action ID conventions.** `Action.custom: u32` IDs are opaque
 to zigline; applications assign their own labels. Recommended
@@ -128,6 +129,27 @@ shipped:
    regressions.
 
 Items in `FUTURE.md` not on this list are post-v1.0.
+
+## Recent additions
+
+- **post-v0.3.1 — Ghost-text hint hook (`Options.hint`) + `Action.accept_hint`.**
+  New public surface in `src/hint.zig` (`HintHook`, `HintRequest`,
+  `HintResult`) re-exported from `root.zig`. `HintResult.style` is
+  `?Style`; `null` means "use the editor's default ghost style"
+  (`.{ .dim = true }`). `accept_hint` consumes the validated hint
+  cached at the most recent render (no re-invoke of the hook at
+  dispatch time, so the user always accepts the bytes they saw).
+  `Diagnostic.Kind` gains `hint_hook_failed` and `hint_invalid_text`;
+  per the experimental-variants policy above, switch statements on
+  `Diagnostic.Kind` should already include an `else` branch.
+
+  **Default keymap change.** `Keymap.defaultEmacs` rebinds Right
+  Arrow (no ctrl) and `Ctrl-F` to `accept_hint`. `accept_hint` falls
+  back to `move_right` when no hint is active or the cursor isn't at
+  end-of-buffer, so the observable behavior for embedders that don't
+  configure a `HintHook` is identical to v0.3.x. Embedders with
+  bespoke keymaps that switched on `Action` are unaffected (they
+  produce actions; they don't observe defaults).
 
 ## Known issues
 

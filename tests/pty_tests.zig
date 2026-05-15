@@ -619,6 +619,79 @@ test "pty: completion fills longest common prefix" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "got: wonderful") != null);
 }
 
+test "pty: ghost-text hint renders dim suffix and accepts via Right Arrow" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // The with_hint example suggests the missing suffix of
+    // "hello world" for any prefix the user has typed. Type "hel",
+    // then Right Arrow to accept the cached suffix " world" that
+    // the previous render drew, then Enter to submit.
+    const r = try runScriptOn(alloc, "zig-out/bin/with_hint", &.{}, &.{
+        .{ .send = "hel", .settle_ms = 200 },
+        .{ .send = "\x1b[C", .settle_ms = 200 }, // Right Arrow → accept_hint
+        .{ .send = "\n" },
+        .{ .send = "\x04" },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: hello world") != null);
+    // The dim SGR (`\x1b[2m`) must appear in the rendered stream.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "\x1b[2m") != null);
+}
+
+test "pty: ghost-text hint without accept submits only typed bytes" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // Type "hel" — render draws " world" as ghost text — then press
+    // Enter immediately. The accepted line must be only what the
+    // user typed, not the visible suggestion.
+    const r = try runScriptOn(alloc, "zig-out/bin/with_hint", &.{}, &.{
+        .{ .send = "hel\n", .settle_ms = 200 },
+        .{ .send = "\x04" },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    // Cooked-mode output translates LF → CRLF, so look for the
+    // exact terminator the kernel will emit and assert the visible
+    // ghost suffix did NOT bleed into the accepted line.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: hel\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: hel world") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: hello") == null);
+}
+
+test "pty: Ctrl-F accepts ghost-text hint same as Right Arrow" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const r = try runScriptOn(alloc, "zig-out/bin/with_hint", &.{}, &.{
+        .{ .send = "hel\x06", .settle_ms = 200 }, // Ctrl-F → accept_hint
+        .{ .send = "\n" },
+        .{ .send = "\x04" },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: hello world") != null);
+}
+
+test "pty: Right Arrow without active hint still moves cursor" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // Type "abc" (no hint hook configured in `minimal`), then Left
+    // twice → Right once → 'X' → Enter. Expected: "abXc". This
+    // proves accept_hint's fallback to move_right preserves the old
+    // arrow-key semantics when no hint is active.
+    const r = try runScript(alloc, &.{}, &.{
+        .{ .send = "abc\x1b[D\x1b[D\x1b[CX\n" },
+        .{ .send = "\x04" },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: abXc") != null);
+}
+
 test "pty: multi-key chord (Ctrl-X Ctrl-U) dispatches the bound action" {
     if (!ptySupported()) return error.SkipZigTest;
 

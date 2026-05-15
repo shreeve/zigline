@@ -100,6 +100,7 @@ zigline/
 │   ├── history.zig       # in-memory navigation + persistent flat file
 │   ├── completion.zig    # CompletionHook + CompletionRequest/Result types
 │   ├── highlight.zig     # HighlightHook + HighlightSpan/Style types
+│   ├── hint.zig          # HintHook + HintRequest/Result types (ghost text)
 │   └── prompt.zig        # Prompt type (bytes + display width)
 ├── examples/
 │   ├── minimal.zig       # smallest possible usage (~30 lines)
@@ -759,7 +760,7 @@ and contained row clearing:
 ### v0.1 — width math
 
 ```
-total_cols      = prompt.width + sum(cluster.width for c in clusters)
+total_cols      = prompt.width + sum(cluster.width for c in clusters) + hint_cols
 new_rows        = max(1, ceil_div(total_cols, term_cols))
 cursor_pos_cols = prompt.width + sum(cluster.width for c in clusters[0..cursor_cluster_idx])
 new_cur_row     = cursor_pos_cols / term_cols
@@ -767,7 +768,11 @@ new_cur_col     = cursor_pos_cols % term_cols
 ```
 
 `prompt.width` is provided by the caller in the `Prompt` value, so
-escapes in the prompt don't break the math.
+escapes in the prompt don't break the math. `hint_cols` is the
+display width of the active ghost-text hint (zero when no hint is
+present); it contributes to row count, exact-fill phantom-newline
+detection, and stale-frame clearing — but never to cursor position
+(see §7 Hint contract).
 
 ### v0.2 — row-granular diff
 
@@ -1100,6 +1105,7 @@ pub const Options = struct {
     /// Optional callbacks.
     completion: ?CompletionHook = null,
     highlight: ?HighlightHook = null,
+    hint: ?HintHook = null,
 
     /// Width handling.
     width_policy: WidthPolicy = .{},
@@ -1205,12 +1211,77 @@ pub const HighlightHook = struct {
         request: HighlightRequest,
     ) anyerror![]HighlightSpan,
 };
+
+pub const HintRequest = struct {
+    /// Snapshot of the buffer at hook-call time. Borrowed; valid
+    /// only for the duration of `hintFn`.
+    buffer: []const u8,
+    /// Cursor byte offset. Currently always equals `buffer.len`
+    /// (the editor only invokes the hook when the cursor is at end
+    /// of buffer); reserved here for future partial-suffix variants.
+    cursor_byte: usize,
+};
+
+pub const HintResult = struct {
+    /// Virtual suffix to draw after the editable buffer. Borrowed;
+    /// the editor copies into its own cache before returning from
+    /// the hook call.
+    text: []const u8,
+    /// Optional style override.
+    ///   - `null`        → editor uses `.{ .dim = true }` (default).
+    ///   - `Style{...}`  → caller-controlled styling. Pass `.{}`
+    ///                     explicitly for an unstyled hint.
+    style: ?Style = null,
+};
+
+pub const HintHook = struct {
+    ctx: *anyopaque,
+    hintFn: *const fn (
+        ctx: *anyopaque,
+        request: HintRequest,
+    ) anyerror!?HintResult,
+};
 ```
 
 `HighlightRequest` mirrors `CompletionRequest` and
 `CustomActionRequest`. The struct shape is the long-term shape: new
 optional fields (terminal width, render column, in-flight action
 info) ship as v0.x non-breaking additions when needed.
+
+### Hint contract (post-v0.3.x)
+
+The hint hook drives fish-style ghost-text autosuggestions. Three
+load-bearing properties:
+
+1. **The hook is consultative, not authoritative.** Hint text never
+   enters `Buffer` until the user dispatches `Action.accept_hint`.
+   Pressing Enter without accepting submits exactly what the user
+   typed — the visible ghost text contributes zero bytes to the
+   accepted line.
+2. **The editor accepts what the user saw.** The hint that any
+   given render drew is cached (validated, allocator-owned) on the
+   editor. `accept_hint` consumes the cache. The hook is **not**
+   re-invoked at dispatch time, so a non-deterministic ranker
+   (e.g. a history scan that picks differently between renders)
+   cannot surface a different suggestion than the one the user is
+   visually committing to.
+3. **End-of-buffer gating.** The hook fires only when
+   `cursor_byte == buffer.len`. Suggesting mid-buffer suffixes is
+   semantically muddy and currently out of scope.
+
+Validation: hint text must be valid UTF-8 with no control bytes
+(same `findUnsafeByte` policy as completion candidates). Failures
+route to the diagnostic hook (`hint_hook_failed`,
+`hint_invalid_text`) and the hint is dropped from rendering.
+
+`Action.accept_hint` is a navigation/insert hybrid: when the cache
+is live and matches the live buffer (`buffer_len + cursor_byte`
+both equal and at end-of-buffer), it inserts the cached suffix as
+a single undoable step; otherwise it falls back to `move_right`.
+The default emacs keymap binds Right Arrow (no ctrl) and `Ctrl-F`
+to `accept_hint` — the fallback preserves their classic
+cursor-movement behavior for embedders that don't configure a
+`HintHook`.
 
 ### Error model
 

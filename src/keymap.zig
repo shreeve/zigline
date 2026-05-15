@@ -279,7 +279,7 @@ fn emacsLookup(key: KeyEvent) ?Action {
         .home => return .move_to_start,
         .end => return .move_to_end,
         .arrow_left => return if (key.mods.ctrl) Action.move_word_left else Action.move_left,
-        .arrow_right => return if (key.mods.ctrl) Action.move_word_right else Action.move_right,
+        .arrow_right => return if (key.mods.ctrl) Action.move_word_right else Action.accept_hint,
         .arrow_up => return .history_prev,
         .arrow_down => return .history_next,
         .escape => return null, // bare ESC does nothing in emacs mode
@@ -296,7 +296,7 @@ fn charLookup(c: u21, mods: input.Modifiers) ?Action {
             'c' => .cancel_line,
             'd' => .eof,
             'e' => .move_to_end,
-            'f' => .move_right,
+            'f' => .accept_hint,
             'h' => .delete_backward,
             'k' => .kill_to_end,
             'l' => .clear_screen,

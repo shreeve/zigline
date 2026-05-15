@@ -38,6 +38,9 @@ pub const Action = union(enum) {
 
     // Completion.
     complete,
+    /// Accept the active virtual hint. If no hint is active, behaves
+    /// like `move_right` so Right Arrow / Ctrl-F keep normal movement.
+    accept_hint,
 
     // Line lifecycle.
     accept_line,

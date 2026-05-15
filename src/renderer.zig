@@ -39,11 +39,13 @@ pub const Allocator = std.mem.Allocator;
 /// terminal cells. Pulled out as a value so it's unit-testable without
 /// instantiating a real terminal. See SPEC.md §6.
 pub const Layout = struct {
-    /// Total display columns of prompt + buffer.
+    /// Total display columns of prompt + buffer + hint.
     total_cols: usize,
-    /// Display columns of prompt + buffer up to the cursor.
+    /// Display columns of prompt + buffer up to the cursor. The
+    /// hint never contributes to cursor position (it's virtual).
     cursor_cols: usize,
-    /// Number of terminal rows the rendered frame occupies.
+    /// Number of terminal rows the rendered frame occupies, including
+    /// the hint's contribution.
     rows: usize,
     /// Cursor's row within the frame (0-indexed from prompt start).
     cursor_row: usize,
@@ -52,7 +54,9 @@ pub const Layout = struct {
     /// True if `total_cols` is an exact multiple of `term_cols` —
     /// the autowrap-corner case where the terminal hasn't yet
     /// committed to the next row, and we have to emit `\n\r` to
-    /// pin the cursor to a known position.
+    /// pin the cursor to a known position. Includes hint width:
+    /// if the hint is what pushes the line to exact-fill, we still
+    /// need the phantom newline to land cursor positioning sanely.
     needs_phantom_nl: bool,
 
     pub fn compute(
@@ -60,6 +64,7 @@ pub const Layout = struct {
         clusters: []const buffer_mod.Cluster,
         cursor_byte: usize,
         term_cols: usize,
+        hint_cols: usize,
     ) Layout {
         std.debug.assert(term_cols > 0);
 
@@ -69,7 +74,7 @@ pub const Layout = struct {
             if (c.byte_start < cursor_byte) prebuf += c.width;
             bufw += c.width;
         }
-        const total = prompt_width + bufw;
+        const total = prompt_width + bufw + hint_cols;
         const cursor = prompt_width + prebuf;
         const rows = if (total == 0) 1 else (total + term_cols - 1) / term_cols;
         const cur_row = if (cursor == 0) 0 else cursor / term_cols;
@@ -83,6 +88,19 @@ pub const Layout = struct {
             .needs_phantom_nl = total > 0 and total % term_cols == 0,
         };
     }
+};
+
+/// Pre-validated ghost-text payload. The editor produces this from a
+/// `HintHook` result after UTF-8 + control-byte validation; the
+/// renderer just draws it. Renderer-internal — public hint API lives
+/// in `hint.zig`.
+pub const HintDraw = struct {
+    text: []const u8,
+    style: highlight.Style,
+    /// Display columns of `text` under the active width policy. The
+    /// editor pre-computes this so the renderer doesn't have to call
+    /// the grapheme layer (which can fail).
+    cols: usize,
 };
 
 pub const Renderer = struct {
@@ -129,13 +147,21 @@ pub const Renderer = struct {
         self.last_term_cols = 0;
     }
 
-    /// Repaint the prompt + buffer + cursor.
+    /// Repaint the prompt + buffer + (optional ghost-text hint) +
+    /// cursor.
+    ///
+    /// `hint` is non-null only when the editor has a validated hint
+    /// to draw (cursor at end of buffer, hook returned a hint, text
+    /// passed UTF-8 + control-byte validation, dupe + width-compute
+    /// succeeded). The renderer trusts these invariants and just
+    /// draws — see `Editor.render` for the gating logic.
     pub fn render(
         self: *Renderer,
         terminal: *terminal_mod.Terminal,
         prompt: prompt_mod.Prompt,
         buffer: *buffer_mod.Buffer,
         spans: []const highlight.HighlightSpan,
+        hint: ?HintDraw,
     ) !void {
         try buffer.ensureClusters();
         const size = terminal.querySize();
@@ -160,11 +186,13 @@ pub const Renderer = struct {
         }
         self.last_term_cols = size.cols;
 
+        const hint_cols: usize = if (hint) |h| h.cols else 0;
         const layout = Layout.compute(
             prompt.width,
             buffer.clusters.items,
             buffer.cursor_byte,
             cols,
+            hint_cols,
         );
 
         const normalized = try self.normalizeSpans(buffer, spans);
@@ -196,9 +224,19 @@ pub const Renderer = struct {
             try w.writeByte('\r');
         }
 
-        // Step 3 — write prompt + buffer (with optional spans).
+        // Step 3 — write prompt + buffer (with optional spans), then
+        // any ghost-text hint with its own SGR pair. The hint draws
+        // AFTER `writeBuffer`'s final `\x1b[0m`, so SGR state for the
+        // hint is independent of any span's leftover state.
         try w.writeAll(prompt.bytes);
         try writeBuffer(w, buffer, normalized);
+        if (hint) |h| {
+            if (h.text.len > 0) {
+                try writeSgrOpen(w, h.style);
+                try w.writeAll(h.text);
+                try w.writeAll("\x1b[0m");
+            }
+        }
 
         // Step 4 — phantom-newline fix for the autowrap edge case.
         if (layout.needs_phantom_nl) try w.writeAll("\n\r");
@@ -474,7 +512,7 @@ fn cluster2(start: usize, end: usize) buffer_mod.Cluster {
 }
 
 test "layout: empty buffer, empty prompt, one row" {
-    const lay = Layout.compute(0, &.{}, 0, 80);
+    const lay = Layout.compute(0, &.{}, 0, 80, 0);
     try std.testing.expectEqual(@as(usize, 1), lay.rows);
     try std.testing.expectEqual(@as(usize, 0), lay.cursor_row);
     try std.testing.expectEqual(@as(usize, 0), lay.cursor_col);
@@ -485,7 +523,7 @@ test "layout: short ASCII line on wide terminal" {
     const cs = [_]buffer_mod.Cluster{
         cluster1(0, 1), cluster1(1, 2), cluster1(2, 3), cluster1(3, 4), cluster1(4, 5),
     };
-    const lay = Layout.compute(2, &cs, 5, 80);
+    const lay = Layout.compute(2, &cs, 5, 80, 0);
     try std.testing.expectEqual(@as(usize, 7), lay.total_cols);
     try std.testing.expectEqual(@as(usize, 1), lay.rows);
     try std.testing.expectEqual(@as(usize, 0), lay.cursor_row);
@@ -497,7 +535,7 @@ test "layout: cursor mid-line lands on right column" {
     const cs = [_]buffer_mod.Cluster{
         cluster1(0, 1), cluster1(1, 2), cluster1(2, 3), cluster1(3, 4), cluster1(4, 5),
     };
-    const lay = Layout.compute(2, &cs, 3, 80);
+    const lay = Layout.compute(2, &cs, 3, 80, 0);
     try std.testing.expectEqual(@as(usize, 5), lay.cursor_col);
     try std.testing.expectEqual(@as(usize, 0), lay.cursor_row);
 }
@@ -506,7 +544,7 @@ test "layout: exact-width line triggers phantom newline" {
     var cs: [6]buffer_mod.Cluster = undefined;
     var i: usize = 0;
     while (i < 6) : (i += 1) cs[i] = cluster1(i, i + 1);
-    const lay = Layout.compute(2, &cs, 6, 8);
+    const lay = Layout.compute(2, &cs, 6, 8, 0);
     try std.testing.expectEqual(@as(usize, 8), lay.total_cols);
     try std.testing.expectEqual(@as(usize, 1), lay.rows);
     try std.testing.expect(lay.needs_phantom_nl);
@@ -516,7 +554,7 @@ test "layout: wrapped buffer occupies multiple rows" {
     var cs: [18]buffer_mod.Cluster = undefined;
     var i: usize = 0;
     while (i < 18) : (i += 1) cs[i] = cluster1(i, i + 1);
-    const lay = Layout.compute(2, &cs, 18, 10);
+    const lay = Layout.compute(2, &cs, 18, 10, 0);
     try std.testing.expectEqual(@as(usize, 20), lay.total_cols);
     try std.testing.expectEqual(@as(usize, 2), lay.rows);
     try std.testing.expectEqual(@as(usize, 2), lay.cursor_row);
@@ -528,7 +566,7 @@ test "layout: wide CJK clusters count as 2 cells each" {
     const cs = [_]buffer_mod.Cluster{
         cluster2(0, 3), cluster2(3, 6), cluster2(6, 9), cluster2(9, 12), cluster2(12, 15),
     };
-    const lay = Layout.compute(0, &cs, 9, 20);
+    const lay = Layout.compute(0, &cs, 9, 20, 0);
     try std.testing.expectEqual(@as(usize, 10), lay.total_cols);
     try std.testing.expectEqual(@as(usize, 6), lay.cursor_col);
     try std.testing.expectEqual(@as(usize, 0), lay.cursor_row);
@@ -539,11 +577,68 @@ test "layout: cursor on second visual row past wrap" {
     var cs: [8]buffer_mod.Cluster = undefined;
     var i: usize = 0;
     while (i < 8) : (i += 1) cs[i] = cluster1(i, i + 1);
-    const lay = Layout.compute(0, &cs, 7, 5);
+    const lay = Layout.compute(0, &cs, 7, 5, 0);
     try std.testing.expectEqual(@as(usize, 2), lay.rows);
     try std.testing.expectEqual(@as(usize, 1), lay.cursor_row);
     try std.testing.expectEqual(@as(usize, 2), lay.cursor_col);
     try std.testing.expect(!lay.needs_phantom_nl);
+}
+
+// -----------------------------------------------------------------------------
+// Hint-inclusive layout tests
+// -----------------------------------------------------------------------------
+
+test "layout: hint contributes to rows but not cursor position" {
+    // prompt=2, buffer="hello" (5), hint=" world" (6). Cursor at end
+    // of buffer (byte 5). On a 10-col terminal: total = 2+5+6 = 13,
+    // rows = 2, cursor stays at prompt+buf = 7 (row 0, col 7).
+    const cs = [_]buffer_mod.Cluster{
+        cluster1(0, 1), cluster1(1, 2), cluster1(2, 3), cluster1(3, 4), cluster1(4, 5),
+    };
+    const lay = Layout.compute(2, &cs, 5, 10, 6);
+    try std.testing.expectEqual(@as(usize, 13), lay.total_cols);
+    try std.testing.expectEqual(@as(usize, 7), lay.cursor_cols);
+    try std.testing.expectEqual(@as(usize, 2), lay.rows);
+    try std.testing.expectEqual(@as(usize, 0), lay.cursor_row);
+    try std.testing.expectEqual(@as(usize, 7), lay.cursor_col);
+    try std.testing.expect(!lay.needs_phantom_nl);
+}
+
+test "layout: hint pushes phantom newline at exact terminal width" {
+    // prompt=0, buffer=4, hint=4 → total 8 on 8-col term. Phantom NL
+    // because the hint is what completes the row to exact-fill.
+    var cs: [4]buffer_mod.Cluster = undefined;
+    var i: usize = 0;
+    while (i < 4) : (i += 1) cs[i] = cluster1(i, i + 1);
+    const lay = Layout.compute(0, &cs, 4, 8, 4);
+    try std.testing.expectEqual(@as(usize, 8), lay.total_cols);
+    try std.testing.expectEqual(@as(usize, 4), lay.cursor_cols);
+    try std.testing.expectEqual(@as(usize, 1), lay.rows);
+    try std.testing.expect(lay.needs_phantom_nl);
+}
+
+test "layout: hint spanning multiple rows past the cursor" {
+    // prompt=0, buffer=2, hint=18 → total 20 on 5-col term. 4 rows.
+    // Cursor remains at col 2 of row 0.
+    const cs = [_]buffer_mod.Cluster{ cluster1(0, 1), cluster1(1, 2) };
+    const lay = Layout.compute(0, &cs, 2, 5, 18);
+    try std.testing.expectEqual(@as(usize, 20), lay.total_cols);
+    try std.testing.expectEqual(@as(usize, 4), lay.rows);
+    try std.testing.expectEqual(@as(usize, 0), lay.cursor_row);
+    try std.testing.expectEqual(@as(usize, 2), lay.cursor_col);
+    try std.testing.expect(lay.needs_phantom_nl);
+}
+
+test "layout: zero hint_cols matches no-hint case" {
+    // Sanity: explicit 0 for hint_cols matches the pre-hint behavior.
+    const cs = [_]buffer_mod.Cluster{
+        cluster1(0, 1), cluster1(1, 2), cluster1(2, 3), cluster1(3, 4), cluster1(4, 5),
+    };
+    const a = Layout.compute(2, &cs, 5, 80, 0);
+    try std.testing.expectEqual(@as(usize, 7), a.total_cols);
+    try std.testing.expectEqual(@as(usize, 1), a.rows);
+    try std.testing.expectEqual(@as(usize, 7), a.cursor_col);
+    try std.testing.expect(!a.needs_phantom_nl);
 }
 
 // =============================================================================

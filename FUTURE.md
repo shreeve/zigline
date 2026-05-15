@@ -84,8 +84,18 @@ Two emacs editing primitives still pending here:
   REPL can decide whether Enter accepts the line or inserts a newline.
   Pairs with multi-line text-area mode. Reference: `rustyline/src/validate.rs`,
   `reedline/src/validator/`.
-- **Hints (ghost text).** Right-of-cursor suggestion rendering. Fish-
-  style. Reference: `reedline/src/hinter/`.
+- **Word-by-word hint accept (`Alt-Right` / fish-style).** Today
+  `accept_hint` consumes the whole cached suffix. Add a sibling
+  action that accepts just the next word/grapheme cluster of the
+  cached hint, so users can step into a long suggestion without
+  committing to all of it. Reference: fish `forward-single-char`
+  / `forward-word` on `accept-autosuggestion`.
+- **Async hint hooks.** Hint hook is currently synchronous and
+  fires on every render whose cursor is at end-of-buffer. Long
+  ranking computations block the keystroke. Pair with the
+  multiplexing API (below): hook returns a token, editor polls /
+  is woken when the hint becomes available, renders without
+  blocking the main read.
 - **Numeric arguments.** `M-3 C-f` for "move 3 words." Same machinery
   vi-mode repeat counts will need.
 - **Configurable word-boundary policy.** Currently word movement is
@@ -122,10 +132,20 @@ Two emacs editing primitives still pending here:
   `replxx_set_double_tab_completion`, `_immediate_completion`,
   `_complete_on_empty`, `_beep_on_ambiguous_completion`,
   `_completion_count_cutoff`.
-- **Hint debounce.** When hints ship, expose a "wait N ms after
-  last keystroke before invoking the hint hook" knob so quick
-  typing doesn't show stale hints. Reference:
-  `replxx_set_hint_delay`.
+- **Hint debounce.** Expose a "wait N ms after the last keystroke
+  before invoking the hint hook" knob so quick typing doesn't
+  show stale hints and slow rankers don't tax keystroke latency.
+  Reference: `replxx_set_hint_delay`.
+- **Hint size guard (`Options.max_hint_bytes`).** Hint hooks can
+  return arbitrarily large text today; cache + width-compute
+  costs scale with size. Cap at a reasonable default (e.g. 1 KiB)
+  with the option to override. Diagnostic on truncation.
+- **Split `hint_hook_failed` diagnostic.** Currently overloads
+  three failure modes (hook error, displayWidth failure, dupe
+  failure). Once the API matures, split into `hint_hook_failed`,
+  `hint_invalid_text`, and `hint_render_failed` so embedders can
+  distinguish "hook bug" from "OOM / system limit" and react
+  appropriately.
 - **Multi-line indent.** When buffer wraps onto a continuation
   row, indent the wrapped portion to align under the prompt
   width. Visual polish; small renderer change. Reference:

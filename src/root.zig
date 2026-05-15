@@ -123,6 +123,10 @@ pub const CompletionResult = @import("completion.zig").CompletionResult;
 pub const Candidate = @import("completion.zig").Candidate;
 pub const CandidateKind = @import("completion.zig").CandidateKind;
 
+pub const HintHook = @import("hint.zig").HintHook;
+pub const HintRequest = @import("hint.zig").HintRequest;
+pub const HintResult = @import("hint.zig").HintResult;
+
 /// Application-defined action hook. Bind a key to
 /// `Action{ .custom = id }` in your keymap, set `Options.custom_action`,
 /// and the editor invokes the hook with the buffer snapshot. Returned
@@ -217,6 +221,7 @@ test {
     _ = @import("terminal.zig");
     _ = @import("history.zig");
     _ = @import("completion.zig");
+    _ = @import("hint.zig");
     _ = @import("highlight.zig");
     _ = @import("prompt.zig");
     _ = @import("kill_ring.zig");
