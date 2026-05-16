@@ -635,7 +635,7 @@ pub const Editor = struct {
                 },
                 .key => |kev| {
                     if (self.transient != null) {
-                        if (try self.handleKeyTransient(kev)) |result| {
+                        if (try self.handleKeyTransient(kev, prompt)) |result| {
                             if (self.options.history) |h| h.resetCursor();
                             return result;
                         }
@@ -1059,6 +1059,7 @@ pub const Editor = struct {
     fn handleKeyTransient(
         self: *Editor,
         kev: input_mod.KeyEvent,
+        prompt: prompt_mod.Prompt,
     ) !?ReadLineResult {
         var t = &self.transient.?;
 
@@ -1132,7 +1133,7 @@ pub const Editor = struct {
                         // to drop both the search and the buffer.
                         'c' => blk: {
                             self.abortTransientBestEffort();
-                            break :blk try self.cancelCurrentLine();
+                            break :blk try self.cancelCurrentLine(prompt);
                         },
                         // Ctrl-A: query move-to-start.
                         'a' => blk: {
@@ -1180,7 +1181,6 @@ pub const Editor = struct {
             else => return null,
         }
     }
-
 
     fn diag(self: *Editor, d: Diagnostic) void {
         if (self.options.diagnostic) |dh| dh.report(d);
@@ -1490,22 +1490,29 @@ pub const Editor = struct {
                 // clears the changeset.
                 try self.buffer.replaceAll(t);
                 try self.renderInternal(prompt, false);
-                return try self.acceptCurrentLine();
+                return try self.acceptCurrentLine(prompt);
             },
-            .accept_line => return try self.acceptCurrentLine(),
-            .cancel_line => return try self.cancelCurrentLine(),
+            .accept_line => return try self.acceptCurrentLine(prompt),
+            .cancel_line => return try self.cancelCurrentLine(prompt),
         }
     }
 
     /// Finalize the rendered block, take the buffer, append to
     /// history. Shared between the `.accept_line` action arm and the
     /// custom-action `.accept_line` result variant.
-    fn acceptCurrentLine(self: *Editor) !ReadLineResult {
-        // Drop any cached hint snapshot before the buffer is taken;
-        // a stale cache would never match the next render's buffer
-        // anyway, but freeing here keeps the field's lifetime tied
-        // to the line that produced it.
-        self.clearHintCache();
+    fn acceptCurrentLine(self: *Editor, prompt: prompt_mod.Prompt) !ReadLineResult {
+        // Repaint once with `with_hint = false` BEFORE finalizing so
+        // any dim ghost-text suffix the hint hook last rendered is
+        // wiped from the terminal. `finalize` only emits CRLF; it
+        // does not redraw. Without this hint-free repaint, Enter on
+        // a buffer like `sleep|` (cursor at `|`) with the hint hook
+        // suggesting `30` would leave ` 30` painted on screen after
+        // the prompt is finalized. The renderer's per-row `\x1b[K`
+        // clear-to-EOL during the repaint erases the hint pixels;
+        // `renderInternal(prompt, false)` itself drops the cached
+        // hint snapshot, so there's no separate `clearHintCache`
+        // step here.
+        try self.renderInternal(prompt, false);
         try self.renderer.finalize(&self.terminal);
         const out = try self.buffer.take();
         self.changeset.clear();
@@ -1522,8 +1529,12 @@ pub const Editor = struct {
     /// Finalize, echo `^C` if raw, clear buffer + undo. Shared
     /// between the `.cancel_line` action arm and the custom-action
     /// `.cancel_line` result variant.
-    fn cancelCurrentLine(self: *Editor) !ReadLineResult {
-        self.clearHintCache();
+    fn cancelCurrentLine(self: *Editor, prompt: prompt_mod.Prompt) !ReadLineResult {
+        // Repaint without the hint before finalizing for the same
+        // reason as `acceptCurrentLine`: Ctrl-C on a buffer with a
+        // trailing ghost suggestion would otherwise leave the hint
+        // pixels on the line we're about to mark `^C` on.
+        try self.renderInternal(prompt, false);
         try self.renderer.finalize(&self.terminal);
         if (self.options.raw_mode != .disabled and self.terminal.isInputTty()) {
             self.terminal.writeAll("^C\r\n") catch {};
@@ -1818,8 +1829,8 @@ pub const Editor = struct {
             .complete => try self.handleComplete(prompt),
             .accept_hint => try self.handleAcceptHint(),
             .transient_input_open => try self.handleTransientInputOpen(),
-            .accept_line => return try self.acceptCurrentLine(),
-            .cancel_line => return try self.cancelCurrentLine(),
+            .accept_line => return try self.acceptCurrentLine(prompt),
+            .cancel_line => return try self.cancelCurrentLine(prompt),
             .eof => {
                 if (self.buffer.isEmpty()) {
                     try self.renderer.finalize(&self.terminal);
@@ -2829,7 +2840,6 @@ test "editor: withCookedMode propagates func errors" {
     try std.testing.expect(wcm.invoked);
 }
 
-
 // Cursor-aware highlight hook test: verify the editor passes the
 // current `cursor_byte` to the hook through `HighlightRequest`.
 const HighlightProbe = struct {
@@ -3678,6 +3688,67 @@ test "editor: hint with multibyte tail (cursor-at-end check on bytes)" {
     try std.testing.expectEqualStrings("café!", editor.buffer.slice());
 }
 
+test "editor: acceptCurrentLine clears the rendered hint before finalize" {
+    // Regression for a user-visible bug: typing `sleep` while the
+    // hint hook suggested ` 30`, then pressing Enter (without
+    // accepting the hint via Right Arrow / Ctrl-F), used to leave
+    // the dim ` 30` painted on the prompt row even after finalize
+    // moved the cursor below. `acceptCurrentLine` now repaints
+    // once with `with_hint = false` BEFORE finalizing, which lets
+    // the renderer's per-row `\x1b[K` clear-to-EOL wipe the hint
+    // pixels.
+    //
+    // We capture the editor's output via a pipe, render once with
+    // the hint active, then accept and inspect the trailing
+    // capture. The accept-path output must NOT contain the hint
+    // text (` 30`), and it must contain at least one `\x1b[K`
+    // clear-to-EOL emitted as part of the hint-free repaint.
+    var ctx: HintTestCtx = .{ .suggest = " 30" };
+
+    const fds = try openCapturePipe();
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .input_fd = fds[0],
+        .output_fd = fds[1],
+        .hint = ctx.hook(),
+    });
+    defer editor.deinit();
+
+    try editor.buffer.insertText("sleep");
+    const prompt = prompt_mod.Prompt.plain("$ ");
+
+    // First render: the buffer is `sleep` + cursor-at-end → hint
+    // hook returns ` 30` → renderer paints `$ sleep` + dim ` 30`.
+    try editor.renderInternal(prompt, true);
+    const after_render = try drainPipe(std.testing.allocator, fds[0]);
+    defer std.testing.allocator.free(after_render);
+    // Sanity: the dim hint suffix made it into the rendered frame.
+    try std.testing.expect(std.mem.indexOf(u8, after_render, " 30") != null);
+
+    // Accept the line. The path under test: repaint without the
+    // hint, finalize, return `.line = "sleep"`.
+    const result = try editor.acceptCurrentLine(prompt);
+    switch (result) {
+        .line => |line| {
+            defer std.testing.allocator.free(line);
+            try std.testing.expectEqualStrings("sleep", line);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const after_accept = try drainPipe(std.testing.allocator, fds[0]);
+    defer std.testing.allocator.free(after_accept);
+    // The accept-path output must not re-paint the hint suffix...
+    try std.testing.expect(std.mem.indexOf(u8, after_accept, " 30") == null);
+    // ...and must emit at least one clear-to-EOL so the previously
+    // painted hint pixels are wiped from the user's terminal.
+    try std.testing.expect(std.mem.indexOf(u8, after_accept, "\x1b[K") != null);
+}
+
 test "editor: stale-hint clearing — wider prior frame fully cleared" {
     // Render once with a hint, then call render() again with no hint
     // active (hook removed via cursor-not-at-end). The renderer's
@@ -3838,9 +3909,9 @@ test "editor: transient query update fires .query_changed with current text" {
 
     _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
     // Type 'g', 'i', 't' into the query.
-    _ = try editor.handleKeyTransient(keyPrintable('g'));
-    _ = try editor.handleKeyTransient(keyPrintable('i'));
-    _ = try editor.handleKeyTransient(keyPrintable('t'));
+    _ = try editor.handleKeyTransient(keyPrintable('g'), prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyTransient(keyPrintable('i'), prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyTransient(keyPrintable('t'), prompt_mod.Prompt.plain(""));
 
     // 1 .opened + 3 .query_changed.
     try std.testing.expectEqual(@as(usize, 4), ctx.events_len);
@@ -3861,8 +3932,8 @@ test "editor: transient Ctrl-R while open fires .next" {
     }
 
     _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
-    _ = try editor.handleKeyTransient(keyCtrl('r'));
-    _ = try editor.handleKeyTransient(keyCtrl('r'));
+    _ = try editor.handleKeyTransient(keyCtrl('r'), prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyTransient(keyCtrl('r'), prompt_mod.Prompt.plain(""));
 
     try std.testing.expectEqual(@as(usize, 3), ctx.events_len);
     try std.testing.expect(ctx.events[1] == .next);
@@ -3882,7 +3953,7 @@ test "editor: transient Enter with non-empty preview replaces buffer + records u
     try editor.buffer.insertText("original");
     _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
     // Now press Enter.
-    _ = try editor.handleKeyTransient(.{ .code = .enter });
+    _ = try editor.handleKeyTransient(.{ .code = .enter }, prompt_mod.Prompt.plain(""));
 
     try std.testing.expect(editor.transient == null);
     try std.testing.expectEqualStrings("git checkout main", editor.buffer.slice());
@@ -3903,7 +3974,7 @@ test "editor: transient Enter with empty preview clears buffer" {
 
     try editor.buffer.insertText("anything");
     _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
-    _ = try editor.handleKeyTransient(.{ .code = .enter });
+    _ = try editor.handleKeyTransient(.{ .code = .enter }, prompt_mod.Prompt.plain(""));
 
     try std.testing.expect(editor.transient == null);
     try std.testing.expectEqualStrings("", editor.buffer.slice());
@@ -3920,7 +3991,7 @@ test "editor: transient Enter with null preview is a no-op (stays open)" {
 
     try editor.buffer.insertText("kept");
     _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
-    _ = try editor.handleKeyTransient(.{ .code = .enter });
+    _ = try editor.handleKeyTransient(.{ .code = .enter }, prompt_mod.Prompt.plain(""));
 
     try std.testing.expect(editor.transient == null);
     try std.testing.expectEqualStrings("kept", editor.buffer.slice());
@@ -3937,7 +4008,7 @@ test "editor: transient Esc fires .aborted and leaves buffer untouched" {
 
     try editor.buffer.insertText("untouched");
     _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
-    _ = try editor.handleKeyTransient(.{ .code = .escape });
+    _ = try editor.handleKeyTransient(.{ .code = .escape }, prompt_mod.Prompt.plain(""));
 
     try std.testing.expect(editor.transient == null);
     try std.testing.expectEqualStrings("untouched", editor.buffer.slice());
@@ -3960,7 +4031,7 @@ test "editor: transient Ctrl-G fires .aborted (Esc synonym)" {
 
     try editor.buffer.insertText("preserve");
     _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
-    _ = try editor.handleKeyTransient(keyCtrl('g'));
+    _ = try editor.handleKeyTransient(keyCtrl('g'), prompt_mod.Prompt.plain(""));
 
     try std.testing.expect(editor.transient == null);
     try std.testing.expectEqualStrings("preserve", editor.buffer.slice());
@@ -3983,7 +4054,7 @@ test "editor: transient Ctrl-C exits transient and cancels line" {
 
     try editor.buffer.insertText("abandoned");
     _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
-    const result = try editor.handleKeyTransient(keyCtrl('c'));
+    const result = try editor.handleKeyTransient(keyCtrl('c'), prompt_mod.Prompt.plain(""));
 
     try std.testing.expect(editor.transient == null);
     try std.testing.expect(result != null);
@@ -4009,10 +4080,10 @@ test "editor: transient cursor-aware editing via Left + insert" {
     }
 
     _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
-    _ = try editor.handleKeyTransient(keyPrintable('a'));
-    _ = try editor.handleKeyTransient(keyPrintable('c'));
-    _ = try editor.handleKeyTransient(.{ .code = .arrow_left });
-    _ = try editor.handleKeyTransient(keyPrintable('b'));
+    _ = try editor.handleKeyTransient(keyPrintable('a'), prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyTransient(keyPrintable('c'), prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyTransient(.{ .code = .arrow_left }, prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyTransient(keyPrintable('b'), prompt_mod.Prompt.plain(""));
 
     // Query is "abc"; cursor at byte 2 after the insertion.
     try std.testing.expectEqualStrings("abc", editor.transient.?.query.slice());
@@ -4075,7 +4146,7 @@ test "editor: transient hook error fires diagnostic, leaves last cache intact" {
 
     // Now make subsequent hook calls fail; type a char.
     ctx.inject_err = error.RankerCrashed;
-    _ = try editor.handleKeyTransient(keyPrintable('x'));
+    _ = try editor.handleKeyTransient(keyPrintable('x'), prompt_mod.Prompt.plain(""));
 
     try std.testing.expect(diag.count >= 1);
     try std.testing.expectEqual(
@@ -4097,7 +4168,7 @@ test "editor: normal typing after transient exit edits main buffer" {
 
     _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
     // Abort.
-    _ = try editor.handleKeyTransient(.{ .code = .escape });
+    _ = try editor.handleKeyTransient(.{ .code = .escape }, prompt_mod.Prompt.plain(""));
     try std.testing.expect(editor.transient == null);
 
     // Now use the normal handleKeyDirect path (simulating post-exit
