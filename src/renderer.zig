@@ -259,6 +259,69 @@ pub const Renderer = struct {
         self.last_cursor_row = layout.cursor_row;
     }
 
+    /// Erase the currently rendered block in place and reset the
+    /// renderer to a fresh state, leaving the terminal cursor at
+    /// column 0 of the row where the block began. Used by paths
+    /// that want to write text "above" the prompt (e.g.
+    /// `Editor.printAbove` for mid-prompt job notifications): the
+    /// caller follows this with their own writes, then a normal
+    /// `render` redraws the prompt below.
+    ///
+    /// Distinct from `finalize` which moves cursor BELOW the block
+    /// and emits CRLF (used at end of `readLine`). This one CLEARS
+    /// the block so the printed output replaces it visually rather
+    /// than appearing under a duplicated prompt.
+    ///
+    /// Idempotent: when no block is currently rendered
+    /// (`last_rows == 0`), this is a no-op apart from a single `\r`
+    /// to nail the cursor to column 0.
+    pub fn clearRenderedBlock(self: *Renderer, terminal: *terminal_mod.Terminal) !void {
+        // True no-op when nothing is rendered. The cursor is wherever
+        // the application last left it; we have no obligation to nail
+        // it to column 0 in this case (the next caller can do so if
+        // they care). This keeps `printAbove` clean for between-
+        // `readLine` callers and in unit tests.
+        if (self.last_rows == 0) {
+            self.last_term_cols = 0;
+            return;
+        }
+
+        // Reuse the buffered output approach for atomicity.
+        self.out_buf.clearRetainingCapacity();
+        var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &self.out_buf);
+        defer self.out_buf = aw.toArrayList();
+        const w = &aw.writer;
+
+        // Climb to the top of the previous render.
+        if (self.last_cursor_row > 0) {
+            try w.print("\x1b[{d}A", .{self.last_cursor_row});
+        }
+        try w.writeByte('\r');
+
+        // Clear the prior block row-by-row, leaving the cursor at
+        // column 0 of the FIRST row (the row where the prompt
+        // began). After the loop the cursor is on the bottom row
+        // of the cleared block; we climb back up so the caller's
+        // next write lands on the top row.
+        var i: usize = 0;
+        while (i < self.last_rows) : (i += 1) {
+            try w.writeAll("\x1b[K");
+            if (i + 1 < self.last_rows) try w.writeAll("\x1b[B");
+        }
+        if (self.last_rows > 1) {
+            try w.print("\x1b[{d}A", .{self.last_rows - 1});
+        }
+        try w.writeByte('\r');
+
+        try terminal.writeAll(aw.written());
+
+        // Mark fresh — next `render` paints from the cursor's
+        // current row, with no prior-block expectations.
+        self.last_rows = 0;
+        self.last_cursor_row = 0;
+        self.last_term_cols = 0;
+    }
+
     /// Move cursor below the rendered area and emit a newline. Called
     /// at the end of `readLine` so subsequent program output starts on
     /// a fresh row.

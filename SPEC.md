@@ -1108,6 +1108,7 @@ pub const Options = struct {
     highlight: ?HighlightHook = null,
     hint: ?HintHook = null,
     transient_input: ?TransientInputHook = null,
+    on_wake: ?WakeHook = null,
 
     /// Width handling.
     width_policy: WidthPolicy = .{},
@@ -1268,6 +1269,13 @@ pub const TransientInputHook = struct {
         request: TransientInputRequest,
     ) anyerror!TransientInputResult,
 };
+
+pub const PrintError = error{ WriteFailed, UnexpectedEof };
+
+pub const WakeHook = struct {
+    ctx: *anyopaque,
+    onWakeFn: *const fn (ctx: *anyopaque, editor: *Editor) void,
+};
 ```
 
 `HighlightRequest` mirrors `CompletionRequest` and
@@ -1395,6 +1403,68 @@ content as meta-commands), not via the keymap.
 Ctrl-C, EOF, and read-error. It is best-effort — a hook error from
 the abort notification is logged via the diagnostic hook but does
 NOT prevent the exit.
+
+### Mid-prompt notifications contract (post-v0.5.x)
+
+`Editor.printAbove(bytes)` and `Options.on_wake` together provide
+the bash/zsh `set -b`-style mid-prompt notification primitive.
+
+```zig
+pub const PrintError = error{ WriteFailed, UnexpectedEof };
+
+pub const WakeHook = struct {
+    ctx: *anyopaque,
+    onWakeFn: *const fn (ctx: *anyopaque, editor: *Editor) void,
+};
+
+pub fn printAbove(self: *Editor, bytes: []const u8) PrintError!void;
+```
+
+Five load-bearing properties:
+
+1. **The wake mechanism is async-signal-safe; the print path is
+   not.** Signal handlers (SIGCHLD, SIGUSR1, etc.) only do two
+   things: queue a message into application-side state, and call
+   `pokeActiveSignalPipe()`. The actual `printAbove` call happens
+   from `Options.on_wake`, which is invoked from normal control
+   flow inside the read loop.
+
+2. **`on_wake` fires on every signal-pipe wake.** Resize, app-
+   initiated `notifyResize()`, SIGCHLD-style queue-and-poke — all
+   route through the same `.resize` event in the read loop, which
+   now invokes `on_wake` (if configured) before re-rendering. The
+   hook may call `editor.printAbove(...)` zero or more times.
+
+3. **`printAbove` clears in place, then writes.** A new renderer
+   primitive `clearRenderedBlock` climbs to the top of the current
+   frame and emits per-row `\x1b[K` clears, leaving the cursor at
+   column 0 of the row where the prompt began. `printAbove` then
+   writes the bytes directly. Mark-fresh + the read loop's normal
+   re-render paint the prompt below the printed text.
+
+4. **Lone-LF normalization in raw mode.** `\n` not preceded by
+   `\r` is normalized to `\r\n` before being written to the
+   terminal. Existing `\r\n` passes through. Other bytes (ANSI SGR,
+   OSC 8 hyperlinks, BEL) pass through unchanged — `printAbove` is
+   line-oriented terminal output, not byte-perfect raw output.
+   Cooked mode (`raw_mode = .disabled`) writes bytes verbatim and
+   relies on the kernel's line discipline.
+
+5. **Trailing CRLF for non-empty input.** If `bytes` is non-empty
+   and doesn't end in `\n` or `\r`, a trailing `\r\n` (raw) or
+   `\n` (cooked) is auto-appended so the prompt re-renders on a
+   fresh row, not on top of the printed text. Empty `bytes` is a
+   clear-only no-op.
+
+Hint cache is invalidated on every `printAbove` (the cached preview
+no longer corresponds to a visible frame). Transient mode state is
+preserved — calling `printAbove` during a Ctrl-R overlay clears the
+overlay's frame, prints the message, and the overlay redraws on
+the next render.
+
+Re-entrancy: it is safe to call `editor.printAbove` from inside
+`onWakeFn`. It is NOT safe to call `editor.readLine`,
+`editor.deinit`, or otherwise mutate the editor's lifecycle.
 
 ### Error model
 

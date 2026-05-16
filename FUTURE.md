@@ -183,17 +183,10 @@ Two emacs editing primitives still pending here:
   feed-with-available-bytes / stop lets applications integrate
   zigline into their own event loop (`select` / `poll` / `epoll`),
   mixing terminal input with sockets, IPC, timers. Pairs with
-  `Editor.print` (below) for the "print to screen while user is
-  typing" use case. Reference: `linenoise.c::linenoiseEditStart`,
-  `linenoiseEditFeed`, `linenoiseEditStop`. Architectural change;
-  v0.3 or beyond.
-- **Async-safe `Editor.print` / `printAbove`.** Print text above
-  the prompt without disrupting editing. Internally finalizes the
-  rendered block, writes the message, re-renders. Pairs with the
-  multiplexing API for shells with background tasks. Reference:
-  `linenoise.c::linenoiseHide` / `linenoiseShow`,
-  `reedline::external_printer::ExternalPrinter`,
-  `isocline::ic_print`.
+  `Editor.printAbove` (shipped in v0.6.0) for the "print to screen
+  while user is typing" use case. Reference:
+  `linenoise.c::linenoiseEditStart`, `linenoiseEditFeed`,
+  `linenoiseEditStop`. Architectural change; v0.7 or beyond.
 - **Async stop.** `Editor.asyncStop()` thread-safe poke of the
   self-pipe to interrupt a blocking `readLine` from another
   thread. We have the self-pipe; this would be a public ~20 line

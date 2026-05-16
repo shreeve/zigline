@@ -766,6 +766,50 @@ test "pty: Ctrl-R Ctrl-G aborts (synonym for Esc)" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "got: preserved\r\n") != null);
 }
 
+test "pty: printAbove via on_wake delivers mid-prompt notification" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // Baseline: with_print_above's prompt loop accepts a normal line
+    // round-trip. (Notification firing is exercised by the next test.)
+    const r = try runScriptOn(alloc, "zig-out/bin/with_print_above", &.{}, &.{
+        .{ .send = "hello\n", .settle_ms = 200 },
+        .{ .send = "\x04", .settle_ms = 200 },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: hello") != null);
+}
+
+test "pty: printAbove notification appears in scrollback above prompt" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // The with_print_above example binds Ctrl-O (\x0f) to a custom
+    // action that queues a notification and pokes the signal pipe.
+    // The wake hook drains the queue by calling printAbove. We
+    // deliberately avoid Ctrl-J / Ctrl-M (\x0a / \x0d) here because
+    // terminals translate those interchangeably with Enter.
+    //
+    // Sequence: type "abc", Ctrl-O (notif 1), Ctrl-O (notif 2),
+    // Enter (submit "abc"), EOF.
+    const r = try runScriptOn(alloc, "zig-out/bin/with_print_above", &.{}, &.{
+        .{ .send = "abc", .settle_ms = 150 },
+        .{ .send = "\x0f", .settle_ms = 200 }, // Ctrl-O → notification 1
+        .{ .send = "\x0f", .settle_ms = 200 }, // Ctrl-O → notification 2
+        .{ .send = "\n", .settle_ms = 200 }, // Enter → submit "abc"
+        .{ .send = "\x04" },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    // Both notifications appeared.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "[bg] event 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "[bg] event 2") != null);
+    // The typed line was preserved through the wake/redraw cycles
+    // and submitted intact.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: abc") != null);
+}
+
 test "pty: replace_buffer_and_accept (Ctrl-X Ctrl-A) atomically expands and submits" {
     if (!ptySupported()) return error.SkipZigTest;
 

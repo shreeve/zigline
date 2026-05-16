@@ -138,6 +138,17 @@ pub const TransientInputRequest = @import("transient.zig").TransientInputRequest
 pub const TransientInputResult = @import("transient.zig").TransientInputResult;
 pub const TransientInputEvent = @import("transient.zig").TransientInputEvent;
 
+/// Print application text "above" the editor's current rendered
+/// block. The canonical use case is bash/zsh `set -b`-style
+/// background-job notifications mid-prompt: SIGCHLD handler queues
+/// a message and pokes `pokeActiveSignalPipe()`, the read loop
+/// wakes and invokes `Options.on_wake`, the hook calls
+/// `Editor.printAbove(text)` for each queued message, and the
+/// next render redraws the prompt below the printed notifications
+/// with the in-progress buffer + cursor preserved.
+pub const PrintError = @import("editor.zig").PrintError;
+pub const WakeHook = @import("editor.zig").WakeHook;
+
 /// Application-defined action hook. Bind a key to
 /// `Action{ .custom = id }` in your keymap, set `Options.custom_action`,
 /// and the editor invokes the hook with the buffer snapshot. Returned

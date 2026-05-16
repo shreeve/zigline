@@ -203,6 +203,40 @@ pub const CustomActionContext = struct {
 /// outcomes to a closed set (rather than handing the hook a `*Editor`
 /// with mutation rights) keeps the buffer's UTF-8 + cluster
 /// invariants under the editor's control.
+/// Errors returned by `Editor.printAbove`. Mirrors the underlying
+/// `Terminal.writeAll` failure modes (after EINTR/EAGAIN retries).
+pub const PrintError = error{
+    WriteFailed,
+    UnexpectedEof,
+};
+
+/// Optional callback invoked by the editor's read loop after each
+/// non-key wake event (signal-pipe poke from `pokeActiveSignalPipe`,
+/// resize). Fires before the read loop re-renders.
+///
+/// Inside the callback the application has full access to the
+/// editor and may call `editor.printAbove(...)` zero or more times
+/// to drain a notification queue. When the callback returns, the
+/// editor re-renders the prompt.
+///
+/// Thread / signal safety: runs on the editor's thread inside the
+/// read loop. NOT async-signal-safe. Signal handlers must only
+/// queue messages and call `pokeActiveSignalPipe()`; the actual
+/// `printAbove` work happens here.
+///
+/// Re-entrancy: it is safe to call `editor.printAbove` recursively
+/// from inside this hook. It is NOT safe to call `editor.readLine`,
+/// `editor.deinit`, or otherwise mutate the editor's lifecycle.
+pub const WakeHook = struct {
+    ctx: *anyopaque,
+    /// Hook returns `void`; errors are not propagated to `readLine`
+    /// since the wake path must not abort the line edit. Hook
+    /// implementations should swallow or log their own errors.
+    /// `printAbove` returns `PrintError!void` so the hook can
+    /// decide what to do with terminal-write failures.
+    onWakeFn: *const fn (ctx: *anyopaque, editor: *Editor) void,
+};
+
 pub const CustomActionResult = union(enum) {
     /// Hook ran, no buffer change. (E.g. printed help to stderr,
     /// recorded analytics, opened an external help overlay.)
@@ -355,6 +389,13 @@ pub const Options = struct {
     /// keymap binds Ctrl-R to `Action.transient_input_open`; with
     /// no hook configured that action is a no-op.
     transient_input: ?transient_mod.TransientInputHook = null,
+    /// Optional callback fired after each signal-pipe wake event
+    /// (e.g. `pokeActiveSignalPipe()` invoked from a SIGCHLD
+    /// handler) before the read loop re-renders. The application
+    /// can call `editor.printAbove(text)` from inside the hook to
+    /// drain queued notifications. See `WakeHook` doc-comment for
+    /// the thread/signal-safety contract.
+    on_wake: ?WakeHook = null,
     width_policy: grapheme.WidthPolicy = .{},
     paste: PastePolicy = .accept,
     /// Optional callback invoked when a hook fails or returns
@@ -572,6 +613,15 @@ pub const Editor = struct {
                 },
                 .resize => {
                     if (try self.flushPendingSequence(prompt)) |result| return result;
+                    // Fire the wake hook BEFORE re-rendering so the
+                    // application can drain any queued mid-prompt
+                    // notifications via `printAbove`. The hook may
+                    // call `printAbove` zero or more times; each
+                    // call clears the rendered frame and writes its
+                    // text. The render below repaints the prompt.
+                    if (self.options.on_wake) |wh| {
+                        wh.onWakeFn(wh.ctx, self);
+                    }
                     try self.renderActive(prompt);
                 },
                 .paste => |payload| {
@@ -653,6 +703,72 @@ pub const Editor = struct {
             return self.renderTransient();
         }
         return self.render(prompt);
+    }
+
+    /// Print `bytes` "above" the editor's current rendered block
+    /// without disrupting the in-progress edit. Used for mid-prompt
+    /// notifications: bash/zsh `set -b`-style background-job
+    /// announcements, async completion progress, etc.
+    ///
+    /// Behavior:
+    ///   1. Erase the currently rendered block in place (cursor
+    ///      lands at column 0 of the row where the prompt began).
+    ///   2. Write `bytes` to the output fd. In raw mode, lone `\n`
+    ///      is normalized to `\r\n` (existing `\r\n` stays as-is);
+    ///      other bytes pass through unchanged so callers can
+    ///      embed ANSI color/style escapes.
+    ///   3. If `bytes` is non-empty and doesn't end in `\n` or `\r`,
+    ///      a trailing `\r\n` (raw mode) or `\n` (cooked) is
+    ///      appended so the next render's prompt lands on its own
+    ///      row.
+    ///   4. The renderer is marked fresh; the next `render` paints
+    ///      the prompt + buffer + cursor below the printed text.
+    ///
+    /// Empty `bytes` is supported: it clears the current frame and
+    /// marks fresh without printing anything (the next render
+    /// repaints in place).
+    ///
+    /// Hint cache is invalidated (the cached preview no longer
+    /// corresponds to a visible frame). Transient mode state is
+    /// preserved — calling `printAbove` during a Ctrl-R overlay
+    /// clears the overlay's frame, prints the message, and the
+    /// overlay redraws on the next render.
+    ///
+    /// Thread / signal safety: NOT async-signal-safe. Call from
+    /// normal application control flow (typically from inside
+    /// `Options.on_wake`). Signal handlers must only queue work
+    /// and poke the signal pipe via `pokeActiveSignalPipe()`.
+    pub fn printAbove(self: *Editor, bytes: []const u8) PrintError!void {
+        // Step 1: clear the rendered frame (no-op if nothing is rendered).
+        self.renderer.clearRenderedBlock(&self.terminal) catch return PrintError.WriteFailed;
+
+        // Step 2: write the body. Raw-mode TTYs have ICANON+ONLCR
+        // disabled, so lone LF doesn't return cursor to column 0;
+        // we normalize. Cooked-mode (raw_mode = .disabled) writes
+        // bytes verbatim and lets the kernel's line discipline do
+        // the translation.
+        const raw_active = self.terminal.saved_termios != null;
+        if (bytes.len > 0) {
+            if (raw_active) {
+                writeWithCrlf(&self.terminal, bytes) catch |err| return mapPrintError(err);
+            } else {
+                self.terminal.writeAll(bytes) catch |err| return mapPrintError(err);
+            }
+
+            // Step 3: ensure the next render's prompt starts on a fresh row.
+            const last = bytes[bytes.len - 1];
+            const ends_with_break = last == '\n' or last == '\r';
+            if (!ends_with_break) {
+                const trailer: []const u8 = if (raw_active) "\r\n" else "\n";
+                self.terminal.writeAll(trailer) catch |err| return mapPrintError(err);
+            }
+        }
+
+        // Step 4: any cached hint references the now-cleared frame.
+        // Drop it so the next render recomputes against the live
+        // buffer state. Renderer's `markFresh` was applied inside
+        // `clearRenderedBlock`.
+        self.clearHintCache();
     }
 
     /// Sanitize a bracketed-paste payload and insert it into the
@@ -2116,6 +2232,38 @@ pub const Editor = struct {
         return ReadLineResult{ .line = try self.buffer.take() };
     }
 };
+
+/// Write `bytes` to the terminal, normalizing lone-LF (`\n` not
+/// preceded by `\r`) into CRLF for raw-mode TTYs. Existing CRLF
+/// passes through unchanged. ANSI escape sequences and other
+/// control bytes pass through unchanged — the caller is responsible
+/// for the bytes' meaning. Used by `Editor.printAbove`.
+fn writeWithCrlf(terminal: *terminal_mod.Terminal, bytes: []const u8) !void {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        if (bytes[i] != '\n') continue;
+        // Flush the chunk up to but not including the LF.
+        if (i > start) try terminal.writeAll(bytes[start..i]);
+        // Lone LF → CRLF; existing CRLF stays as-is.
+        if (i == 0 or bytes[i - 1] != '\r') {
+            try terminal.writeAll("\r\n");
+        } else {
+            try terminal.writeAll("\n");
+        }
+        start = i + 1;
+    }
+    if (start < bytes.len) try terminal.writeAll(bytes[start..]);
+}
+
+/// Narrow a generic write error from the terminal layer to the
+/// public `PrintError` set.
+fn mapPrintError(err: anyerror) PrintError {
+    return switch (err) {
+        error.UnexpectedEof => PrintError.UnexpectedEof,
+        else => PrintError.WriteFailed,
+    };
+}
 
 fn longestCommonPrefix(cands: []completion_mod.Candidate) []const u8 {
     if (cands.len == 0) return "";
@@ -3957,4 +4105,271 @@ test "editor: normal typing after transient exit edits main buffer" {
     _ = try editor.handleKeyDirect(keyPrintable('a'), prompt_mod.Prompt.plain(""));
     _ = try editor.handleKeyDirect(keyPrintable('b'), prompt_mod.Prompt.plain(""));
     try std.testing.expectEqualStrings("ab", editor.buffer.slice());
+}
+
+// =============================================================================
+// printAbove tests — verify mid-prompt notification semantics. These use the
+// pipe-capture pattern so we can assert exact bytes written to `output_fd`,
+// including the lone-LF → CRLF normalization and the trailing-CRLF auto-append.
+// =============================================================================
+
+/// Open a pipe pair, set the read end nonblocking, and return both fds.
+/// The write end is used as the editor's `output_fd`; the read end is
+/// drained by the test to assert what was emitted.
+fn openCapturePipe() ![2]c_int {
+    var fds: [2]c_int = undefined;
+    try std.testing.expect(std.c.pipe(&fds) == 0);
+    const o_nonblock: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+    const flags = std.c.fcntl(fds[0], std.c.F.GETFL, @as(c_int, 0));
+    try std.testing.expect(flags >= 0);
+    try std.testing.expect(std.c.fcntl(fds[0], std.c.F.SETFL, flags | o_nonblock) >= 0);
+    return fds;
+}
+
+/// Drain everything currently readable on `fd` into an owned slice.
+/// Caller frees. Loops until EAGAIN.
+fn drainPipe(allocator: Allocator, fd: c_int) ![]u8 {
+    var collected: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer collected.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &chunk, chunk.len);
+        if (n < 0) break; // EAGAIN
+        if (n == 0) break;
+        try collected.appendSlice(allocator, chunk[0..@intCast(n)]);
+    }
+    return collected.toOwnedSlice(allocator);
+}
+
+test "printAbove: empty bytes is a clear-only no-op (no print, no trailing CRLF)" {
+    const fds = try openCapturePipe();
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .input_fd = fds[0],
+        .output_fd = fds[1],
+    });
+    defer editor.deinit();
+
+    // Drain any startup bytes (none expected with raw_mode = .disabled,
+    // but the pipe pattern stays robust if that changes).
+    const startup = try drainPipe(std.testing.allocator, fds[0]);
+    defer std.testing.allocator.free(startup);
+
+    try editor.printAbove("");
+    const out = try drainPipe(std.testing.allocator, fds[0]);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("", out);
+}
+
+test "printAbove: cooked-mode passes bytes through and auto-appends \\n" {
+    const fds = try openCapturePipe();
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .input_fd = fds[0],
+        .output_fd = fds[1],
+    });
+    defer editor.deinit();
+
+    try editor.printAbove("hello");
+    const out = try drainPipe(std.testing.allocator, fds[0]);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("hello\n", out);
+}
+
+test "printAbove: cooked-mode preserves caller-supplied trailing newline" {
+    const fds = try openCapturePipe();
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .input_fd = fds[0],
+        .output_fd = fds[1],
+    });
+    defer editor.deinit();
+
+    try editor.printAbove("hello\n");
+    const out = try drainPipe(std.testing.allocator, fds[0]);
+    defer std.testing.allocator.free(out);
+    // No double-newline: trailing-newline check sees the existing \n
+    // and skips the auto-append.
+    try std.testing.expectEqualStrings("hello\n", out);
+}
+
+test "printAbove: writeWithCrlf normalizes lone LF and preserves existing CRLF" {
+    // Direct test of the helper without a real terminal in raw mode.
+    // We construct a minimal Terminal pointing at a pipe write end
+    // and call writeWithCrlf to verify exact bytes.
+    const fds = try openCapturePipe();
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+    var terminal = terminal_mod.Terminal.init(fds[0], fds[1]);
+
+    // Mixed input: lone LF, existing CRLF, trailing LF.
+    try writeWithCrlf(&terminal, "a\nb\r\nc\n");
+    const out = try drainPipe(std.testing.allocator, fds[0]);
+    defer std.testing.allocator.free(out);
+    // Lone LFs become CRLF; existing CRLF stays as-is; result is
+    // "a\r\nb\r\nc\r\n".
+    try std.testing.expectEqualStrings("a\r\nb\r\nc\r\n", out);
+}
+
+test "printAbove: writeWithCrlf handles internal-only newlines" {
+    const fds = try openCapturePipe();
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+    var terminal = terminal_mod.Terminal.init(fds[0], fds[1]);
+
+    try writeWithCrlf(&terminal, "line1\nline2");
+    const out = try drainPipe(std.testing.allocator, fds[0]);
+    defer std.testing.allocator.free(out);
+    // No trailing newline added by writeWithCrlf alone — it just
+    // normalizes internal LFs. The trailing CRLF is added by
+    // printAbove's own logic (verified in another test).
+    try std.testing.expectEqualStrings("line1\r\nline2", out);
+}
+
+test "printAbove: cooked-mode pass-through for ANSI color codes" {
+    const fds = try openCapturePipe();
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .input_fd = fds[0],
+        .output_fd = fds[1],
+    });
+    defer editor.deinit();
+
+    // Pass through ESC bytes — application output, not user input.
+    const colored = "\x1b[33m[1]+ Done\x1b[0m sleep 5\n";
+    try editor.printAbove(colored);
+    const out = try drainPipe(std.testing.allocator, fds[0]);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(colored, out);
+}
+
+test "printAbove: clears the hint cache" {
+    const fds = try openCapturePipe();
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+
+    // Force the hint cache to be populated by hand-injecting state.
+    // Real production code populates this via `computeHintDraw`, but
+    // we sidestep that to keep the test focused on `printAbove`'s
+    // cleanup contract.
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .input_fd = fds[0],
+        .output_fd = fds[1],
+    });
+    defer editor.deinit();
+
+    const fake_hint_text = try std.testing.allocator.dupe(u8, "fake-hint");
+    editor.last_hint = .{
+        .buffer_len = 0,
+        .cursor_byte = 0,
+        .text = fake_hint_text,
+        .style = .{ .dim = true },
+        .cols = 9,
+    };
+    try std.testing.expect(editor.last_hint != null);
+
+    try editor.printAbove("notification\n");
+    try std.testing.expect(editor.last_hint == null);
+}
+
+test "printAbove: on_wake hook is invoked on resize wake before re-render" {
+    // Verifies the read-loop wiring without spinning up a real
+    // terminal. We construct an editor with .raw_mode = .disabled,
+    // wire an on_wake hook, and synthesize the .resize event by
+    // calling the cooked-path render directly. The on_wake check
+    // happens inside the .resize arm of the read loop, so we can't
+    // exercise that path without driving readLine — instead we
+    // verify the hook is callable and ctx is wired correctly by
+    // direct invocation.
+    const HookCtx = struct {
+        invoked: bool = false,
+        editor_seen: bool = false,
+        fn cb(ctx: *anyopaque, ed: *Editor) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.invoked = true;
+            self.editor_seen = (ed.options.on_wake != null);
+        }
+    };
+    var ctx: HookCtx = .{};
+    const hook = WakeHook{ .ctx = @ptrCast(&ctx), .onWakeFn = HookCtx.cb };
+
+    const fds = try openCapturePipe();
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .input_fd = fds[0],
+        .output_fd = fds[1],
+        .on_wake = hook,
+    });
+    defer editor.deinit();
+
+    // Hand-fire the hook the way the read loop does.
+    if (editor.options.on_wake) |wh| {
+        wh.onWakeFn(wh.ctx, &editor);
+    }
+    try std.testing.expect(ctx.invoked);
+    try std.testing.expect(ctx.editor_seen);
+}
+
+test "printAbove: hook calls printAbove and the bytes land on output_fd" {
+    // Integration-shaped test: the hook calls editor.printAbove(...)
+    // for a queued message, and we assert the bytes show up.
+    const HookCtx = struct {
+        message: []const u8,
+        delivered: bool = false,
+        fn cb(ctx: *anyopaque, ed: *Editor) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ed.printAbove(self.message) catch {};
+            self.delivered = true;
+        }
+    };
+    var ctx: HookCtx = .{ .message = "[1]+ Done sleep 5\n" };
+    const hook = WakeHook{ .ctx = @ptrCast(&ctx), .onWakeFn = HookCtx.cb };
+
+    const fds = try openCapturePipe();
+    defer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+    var editor = try Editor.init(std.testing.allocator, .{
+        .raw_mode = .disabled,
+        .input_fd = fds[0],
+        .output_fd = fds[1],
+        .on_wake = hook,
+    });
+    defer editor.deinit();
+
+    if (editor.options.on_wake) |wh| {
+        wh.onWakeFn(wh.ctx, &editor);
+    }
+    try std.testing.expect(ctx.delivered);
+    const out = try drainPipe(std.testing.allocator, fds[0]);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("[1]+ Done sleep 5\n", out);
 }

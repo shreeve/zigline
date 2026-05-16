@@ -70,8 +70,10 @@ the cursor-navigation methods, `HistoryOptions` field set.
 ghost-text autosuggestions, post-v0.3.x). `TransientInputHook`,
 `TransientInputRequest`, `TransientInputResult`, `TransientInputEvent`
 (Ctrl-R reverse-incremental history search overlay, post-v0.4.x).
-`CustomActionHook`, `CustomActionRequest`, `CustomActionResult`,
-`CustomActionContext`. `DiagnosticHook` and `Diagnostic` struct shape.
+`WakeHook` + `Editor.printAbove` (mid-prompt notifications via
+signal-pipe wakes, post-v0.5.x). `CustomActionHook`,
+`CustomActionRequest`, `CustomActionResult`, `CustomActionContext`.
+`DiagnosticHook` and `Diagnostic` struct shape.
 
 **Custom-action ID conventions.** `Action.custom: u32` IDs are opaque
 to zigline; applications assign their own labels. Recommended
@@ -133,6 +135,35 @@ shipped:
 Items in `FUTURE.md` not on this list are post-v1.0.
 
 ## Recent additions
+
+- **post-v0.5.0 — Mid-prompt notifications via `Editor.printAbove` +
+  `Options.on_wake`.**
+  New public surface in `editor.zig` re-exported from `root.zig`:
+  `PrintError` and `WakeHook`. Plus a new method
+  `Editor.printAbove(bytes) PrintError!void` and a new
+  `Renderer.clearRenderedBlock(terminal)` primitive.
+
+  Use case: bash/zsh `set -b`-style background-job notifications
+  mid-prompt. SIGCHLD handler queues a message and pokes
+  `pokeActiveSignalPipe()`; the read loop wakes and invokes
+  `on_wake`; the hook calls `editor.printAbove(text)` for each
+  queued message; the next render redraws the prompt + buffer +
+  cursor below the printed text with the in-progress edit
+  preserved.
+
+  - `printAbove` clears the current rendered block in place, writes
+    bytes (with lone-LF → CRLF normalization in raw mode; existing
+    CRLF passes through), auto-appends a trailing CRLF for non-
+    empty input, marks the renderer fresh, clears the hint cache.
+    Transient-mode state is preserved across calls.
+  - Empty `bytes` is a clear-only no-op.
+  - Bytes pass through unchanged otherwise (ANSI color codes are
+    expected and supported — this is application output, not user
+    input).
+  - `on_wake` fires after every signal-pipe wake (resize,
+    `pokeActiveSignalPipe`, or any future wake source) before the
+    read loop re-renders. The hook receives the live `*Editor`
+    and may call `printAbove` zero or more times.
 
 - **post-v0.4.1 — Transient input overlay (`Options.transient_input`)
   + `Action.transient_input_open`.**
