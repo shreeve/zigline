@@ -127,6 +127,17 @@ pub const HintHook = @import("hint.zig").HintHook;
 pub const HintRequest = @import("hint.zig").HintRequest;
 pub const HintResult = @import("hint.zig").HintResult;
 
+/// Reverse-i-search and other "type a query, see a preview, accept
+/// or abort" overlays. Bind `Action.transient_input_open` (default:
+/// Ctrl-R) and configure `Options.transient_input` with a hook that
+/// translates query state into preview + status text. The editor
+/// owns the keystrokes, the rendering, and the main-buffer
+/// preservation; the hook owns ranking/match selection.
+pub const TransientInputHook = @import("transient.zig").TransientInputHook;
+pub const TransientInputRequest = @import("transient.zig").TransientInputRequest;
+pub const TransientInputResult = @import("transient.zig").TransientInputResult;
+pub const TransientInputEvent = @import("transient.zig").TransientInputEvent;
+
 /// Application-defined action hook. Bind a key to
 /// `Action{ .custom = id }` in your keymap, set `Options.custom_action`,
 /// and the editor invokes the hook with the buffer snapshot. Returned
@@ -222,6 +233,7 @@ test {
     _ = @import("history.zig");
     _ = @import("completion.zig");
     _ = @import("hint.zig");
+    _ = @import("transient.zig");
     _ = @import("highlight.zig");
     _ = @import("prompt.zig");
     _ = @import("kill_ring.zig");

@@ -712,6 +712,60 @@ test "pty: multi-key chord (Ctrl-X Ctrl-U) dispatches the bound action" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "got: hellox") == null);
 }
 
+test "pty: Ctrl-R transient search accepts a match into the buffer" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // The with_history_search example has a fixed list of fake
+    // history entries. Typing "git " into the search overlay should
+    // match `git status` (the first match in newest→oldest order),
+    // and Enter accepts it into the main buffer. Press Enter again
+    // to actually submit the line.
+    const r = try runScriptOn(alloc, "zig-out/bin/with_history_search", &.{}, &.{
+        .{ .send = "\x12git \r", .settle_ms = 250 }, // Ctrl-R, type "git ", Enter (accept match)
+        .{ .send = "\r", .settle_ms = 200 }, // Enter (submit)
+        .{ .send = "\x04" },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: git push origin main") != null);
+    // Search overlay should have rendered with the (reverse-i-search)
+    // status prefix at some point.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "(reverse-i-search)") != null);
+}
+
+test "pty: Ctrl-R Esc aborts and leaves main buffer untouched" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    // Type "abc" → Ctrl-R → "git" → Esc → Enter. The accepted line
+    // is the original "abc"; the search query and preview never
+    // bleed into it.
+    const r = try runScriptOn(alloc, "zig-out/bin/with_history_search", &.{}, &.{
+        .{ .send = "abc\x12git\x1b", .settle_ms = 250 }, // type abc + Ctrl-R + git + Esc
+        .{ .send = "\r", .settle_ms = 200 }, // Enter to submit "abc"
+        .{ .send = "\x04" },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: abc\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: git") == null);
+}
+
+test "pty: Ctrl-R Ctrl-G aborts (synonym for Esc)" {
+    if (!ptySupported()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const r = try runScriptOn(alloc, "zig-out/bin/with_history_search", &.{}, &.{
+        .{ .send = "preserved\x12find\x07", .settle_ms = 250 }, // Ctrl-R, query, Ctrl-G abort
+        .{ .send = "\r", .settle_ms = 200 },
+        .{ .send = "\x04" },
+    });
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "got: preserved\r\n") != null);
+}
+
 test "pty: replace_buffer_and_accept (Ctrl-X Ctrl-A) atomically expands and submits" {
     if (!ptySupported()) return error.SkipZigTest;
 

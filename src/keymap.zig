@@ -303,6 +303,7 @@ fn charLookup(c: u21, mods: input.Modifiers) ?Action {
             'n' => .history_next,
             'p' => .history_prev,
             'q' => .quoted_insert,
+            'r' => .transient_input_open,
             't' => .transpose_chars,
             'u' => .kill_to_start,
             'v' => .quoted_insert,

@@ -69,10 +69,11 @@ Two emacs editing primitives still pending here:
 - **vi-mode keymap.** Modal editing with normal/insert/visual states.
   Reference: `readline/vi_mode.c` for the state machine, `rustyline/src/keymap.rs`
   + `command.rs` for the cleaner Rust factoring.
-- **Reverse-incremental history search.** Ctrl-R style overlay UI
-  with separate search prompt, failed-search retention, repeat-Ctrl-R
-  for older matches, Ctrl-G abort with line restore. Reference:
-  `readline/isearch.c`.
+- **Forward-incremental search (Ctrl-S).** The transient overlay
+  shipped in v0.5.0 supports `.next` (Ctrl-R while open advances to
+  the next older match). Adding `.previous` for Ctrl-S forward
+  search is a natural extension; mostly an enum variant + key
+  binding + hook event. The hook decides direction.
 - **Frecency history sort.** Frequency × recency weighted ranking
   for history navigation, especially for fzf-style history overlays.
 - **History metadata.** Timestamp, exit code, cwd, duration per entry.

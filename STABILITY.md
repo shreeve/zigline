@@ -67,9 +67,11 @@ the cursor-navigation methods, `HistoryOptions` field set.
 `CompletionHook`, `CompletionRequest`, `CompletionResult`, `Candidate`,
 `CandidateKind`. `HighlightHook`, `HighlightRequest`, `HighlightSpan`,
 `Style`, `Color`. `HintHook`, `HintRequest`, `HintResult` (fish-style
-ghost-text autosuggestions, post-v0.3.x). `CustomActionHook`,
-`CustomActionRequest`, `CustomActionResult`, `CustomActionContext`.
-`DiagnosticHook` and `Diagnostic` struct shape.
+ghost-text autosuggestions, post-v0.3.x). `TransientInputHook`,
+`TransientInputRequest`, `TransientInputResult`, `TransientInputEvent`
+(Ctrl-R reverse-incremental history search overlay, post-v0.4.x).
+`CustomActionHook`, `CustomActionRequest`, `CustomActionResult`,
+`CustomActionContext`. `DiagnosticHook` and `Diagnostic` struct shape.
 
 **Custom-action ID conventions.** `Action.custom: u32` IDs are opaque
 to zigline; applications assign their own labels. Recommended
@@ -131,6 +133,31 @@ shipped:
 Items in `FUTURE.md` not on this list are post-v1.0.
 
 ## Recent additions
+
+- **post-v0.4.1 — Transient input overlay (`Options.transient_input`)
+  + `Action.transient_input_open`.**
+  New public surface in `src/transient.zig` (`TransientInputHook`,
+  `TransientInputRequest`, `TransientInputResult`,
+  `TransientInputEvent`) re-exported from `root.zig`. Editor-owned
+  Ctrl-R reverse-incremental search overlay: typed bytes go into a
+  separate query buffer (main buffer untouched), the hook returns a
+  preview + status, the editor renders the overlay reusing the
+  standard `prompt + buffer + hint` pipeline (status as prompt,
+  query as buffer, dim preview as ghost-text suffix).
+
+  - Enter accepts a non-null preview into the main buffer as ONE
+    Replace undo step, exits transient mode, leaves the line for
+    the user to edit or submit (does NOT auto-submit; matches
+    shell Ctrl-R semantics).
+  - Esc / Ctrl-G call the hook with `.aborted` and exit; main
+    buffer is preserved.
+  - Ctrl-C exits transient and cancels the line normally.
+  - Ctrl-R while open fires `.next` so the hook can cycle matches.
+
+  `Diagnostic.Kind` gains `transient_input_hook_failed` and
+  `transient_input_invalid_text`. Default emacs keymap binds Ctrl-R
+  (previously unbound) to `transient_input_open`; with no hook
+  configured the action is a no-op.
 
 - **post-v0.4.0 — `CustomActionResult.replace_buffer_and_accept`.**
   New variant for atomic "replace buffer and submit" custom actions

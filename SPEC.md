@@ -101,6 +101,7 @@ zigline/
 │   ├── completion.zig    # CompletionHook + CompletionRequest/Result types
 │   ├── highlight.zig     # HighlightHook + HighlightSpan/Style types
 │   ├── hint.zig          # HintHook + HintRequest/Result types (ghost text)
+│   ├── transient.zig     # TransientInputHook + Request/Result types (Ctrl-R overlay)
 │   └── prompt.zig        # Prompt type (bytes + display width)
 ├── examples/
 │   ├── minimal.zig       # smallest possible usage (~30 lines)
@@ -1106,6 +1107,7 @@ pub const Options = struct {
     completion: ?CompletionHook = null,
     highlight: ?HighlightHook = null,
     hint: ?HintHook = null,
+    transient_input: ?TransientInputHook = null,
 
     /// Width handling.
     width_policy: WidthPolicy = .{},
@@ -1241,6 +1243,31 @@ pub const HintHook = struct {
         request: HintRequest,
     ) anyerror!?HintResult,
 };
+
+pub const TransientInputEvent = enum {
+    opened, query_changed, next, aborted,
+};
+
+pub const TransientInputRequest = struct {
+    original_buffer: []const u8,
+    original_cursor_byte: usize,
+    query: []const u8,
+    query_cursor_byte: usize,
+    event: TransientInputEvent,
+};
+
+pub const TransientInputResult = struct {
+    preview: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+};
+
+pub const TransientInputHook = struct {
+    ctx: *anyopaque,
+    updateFn: *const fn (
+        ctx: *anyopaque,
+        request: TransientInputRequest,
+    ) anyerror!TransientInputResult,
+};
 ```
 
 `HighlightRequest` mirrors `CompletionRequest` and
@@ -1282,6 +1309,92 @@ The default emacs keymap binds Right Arrow (no ctrl) and `Ctrl-F`
 to `accept_hint` — the fallback preserves their classic
 cursor-movement behavior for embedders that don't configure a
 `HintHook`.
+
+### Transient input contract (post-v0.4.x)
+
+The transient input hook drives editor-owned overlays where the
+user types a query and a preview of the would-be replacement is
+rendered separately from the main buffer — the canonical case is
+reverse-incremental history search (Ctrl-R).
+
+```zig
+pub const TransientInputEvent = enum {
+    opened, query_changed, next, aborted,
+};
+
+pub const TransientInputRequest = struct {
+    original_buffer: []const u8,
+    original_cursor_byte: usize,
+    query: []const u8,
+    query_cursor_byte: usize,
+    event: TransientInputEvent,
+};
+
+pub const TransientInputResult = struct {
+    preview: ?[]const u8 = null,   // null=no match, ""=empty replacement
+    status: ?[]const u8 = null,    // null=editor default
+};
+
+pub const TransientInputHook = struct {
+    ctx: *anyopaque,
+    updateFn: *const fn (
+        ctx: *anyopaque,
+        request: TransientInputRequest,
+    ) anyerror!TransientInputResult,
+};
+```
+
+Five load-bearing properties:
+
+1. **Editor owns input routing.** While transient mode is active,
+   typed bytes go into a separate query buffer; the main buffer is
+   never mutated until accept. The hook does not see keystrokes
+   directly — it sees query state changes via `event`.
+
+2. **Render reuses the main pipeline.** The transient overlay is
+   `synthesized_prompt + query_buffer + preview_as_dim_hint`,
+   passed to the same `renderer.render` used for the normal frame.
+   Status acts as prompt, query as buffer, preview as a ghost-text
+   suffix. Width math, wrap, phantom-newline, and stale-frame
+   clearing reuse the production code paths.
+
+3. **Three-state preview.** `null` → no match, render no preview,
+   Enter is a no-op (stays open). `""` → empty replacement, render
+   no preview text, Enter accepts and clears the main buffer.
+   Non-empty → render dimmed after the cursor, Enter accepts.
+
+4. **Accept does not submit.** Enter with a preview replaces the
+   main buffer (as one Replace undo step) and exits transient
+   mode. The user must press Enter again to actually submit the
+   line — matches shell Ctrl-R UX. Esc / Ctrl-G abort without
+   touching the main buffer; Ctrl-C exits transient and cancels
+   the whole line.
+
+5. **Field-level validation.** `preview` and `status` are validated
+   independently for UTF-8 + control-byte safety. Invalid preview
+   is dropped (no preview rendered). Invalid status falls back to
+   the editor default `(reverse-i-search): `. Either failure
+   routes a `transient_input_invalid_text` diagnostic. Hook errors
+   route `transient_input_hook_failed` and leave the previous
+   cached preview/status in place — a transient glitch (network
+   blip, one-off allocation failure) shouldn't visually wipe a
+   valid earlier match.
+
+Default emacs keymap binds Ctrl-R (previously unbound) to
+`Action.transient_input_open`. With no hook configured the action
+is a no-op — Ctrl-R remains unbound in effect.
+
+While transient mode is active the editor uses a built-in whitelist
+key handler. The application's normal keymap (including any
+`BindingTable` overlay or custom-action bindings) is **not
+consulted** during transient mode. Embedders that need to alter
+transient-mode key handling do so via the hook (interpreting query
+content as meta-commands), not via the keymap.
+
+`.aborted` is fired on every non-accept exit path: Esc, Ctrl-G,
+Ctrl-C, EOF, and read-error. It is best-effort — a hook error from
+the abort notification is logged via the diagnostic hook but does
+NOT prevent the exit.
 
 ### Error model
 

@@ -46,6 +46,7 @@ pub fn build(b: *std.Build) void {
     addExample(b, target, optimize, lib_mod, "with_highlight");
     addExample(b, target, optimize, lib_mod, "with_custom_action");
     addExample(b, target, optimize, lib_mod, "with_hint");
+    addExample(b, target, optimize, lib_mod, "with_history_search");
 
     // =========================================================================
     // Unit tests (per-module test blocks under src/)

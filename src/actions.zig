@@ -42,6 +42,14 @@ pub const Action = union(enum) {
     /// like `move_right` so Right Arrow / Ctrl-F keep normal movement.
     accept_hint,
 
+    /// Enter transient input/search mode. The editor switches to a
+    /// query-and-preview overlay (typically reverse-incremental
+    /// history search) until the user accepts (Enter), aborts (Esc /
+    /// Ctrl-G), or cancels the whole line (Ctrl-C). See
+    /// `Options.transient_input` and `src/transient.zig`. If no hook
+    /// is configured the action is a no-op.
+    transient_input_open,
+
     // Line lifecycle.
     accept_line,
     cancel_line,

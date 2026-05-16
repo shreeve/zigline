@@ -12,6 +12,7 @@ const completion_mod = @import("completion.zig");
 const grapheme = @import("grapheme.zig");
 const highlight_mod = @import("highlight.zig");
 const hint_mod = @import("hint.zig");
+const transient_mod = @import("transient.zig");
 const history_mod = @import("history.zig");
 const input_mod = @import("input.zig");
 const keymap_mod = @import("keymap.zig");
@@ -52,6 +53,8 @@ pub const Diagnostic = struct {
         highlight_hook_failed,
         hint_hook_failed,
         hint_invalid_text,
+        transient_input_hook_failed,
+        transient_input_invalid_text,
         history_append_failed,
         render_failed,
         // Custom-action paths get their own kinds so apps can route
@@ -249,6 +252,39 @@ const YankLastArgState = struct {
     len: usize,
 };
 
+/// Live state for transient input mode (Ctrl-R search overlay).
+/// Created on `Action.transient_input_open`, freed on accept / abort
+/// / cancel. While present, the editor's render and key-handling
+/// paths route to alternates that operate on `query` instead of the
+/// main buffer; the main buffer is held untouched until the user
+/// either accepts a preview into it or aborts.
+///
+/// `last_preview` distinguishes three states:
+///   - `null`         → no match for the current query. Render no
+///                      preview. Enter is a no-op (stays transient).
+///   - `""`  (empty)  → an explicit empty replacement. Render no
+///                      preview text. Enter accepts and clears the
+///                      main buffer.
+///   - non-empty      → render dim ghost text after the query.
+///                      Enter accepts.
+const TransientState = struct {
+    /// Cluster-aware UTF-8 buffer holding the user's search query.
+    /// Reuses `Buffer` so cursor moves, multibyte handling, and
+    /// rendering width math come for free.
+    query: buffer_mod.Buffer,
+    /// Validated, allocator-owned copy of the most recent preview.
+    /// See type doc above for the three-state semantics.
+    last_preview: ?[]u8 = null,
+    /// Validated, allocator-owned copy of the most recent status
+    /// text (e.g. `(reverse-i-search): `). `null` ⇒ render the
+    /// editor default.
+    last_status: ?[]u8 = null,
+    /// Cursor byte offset in the main buffer at the moment Ctrl-R
+    /// was pressed. Surfaced to the hook for context (Slash uses
+    /// this to detect mid-line vs end-of-line invocation).
+    original_cursor_byte: usize,
+};
+
 /// Validated, allocator-owned snapshot of the hint that the most
 /// recent render drew. Held by `Editor` so `accept_hint` inserts
 /// EXACTLY the bytes the user saw — no re-invoke of the hook at
@@ -313,6 +349,12 @@ pub const Options = struct {
     completion: ?completion_mod.CompletionHook = null,
     highlight: ?highlight_mod.HighlightHook = null,
     hint: ?hint_mod.HintHook = null,
+    /// Optional hook driving the transient input overlay used by
+    /// reverse-incremental search (Ctrl-R) and similar "query +
+    /// preview" UX. See `src/transient.zig`. The default emacs
+    /// keymap binds Ctrl-R to `Action.transient_input_open`; with
+    /// no hook configured that action is a no-op.
+    transient_input: ?transient_mod.TransientInputHook = null,
     width_policy: grapheme.WidthPolicy = .{},
     paste: PastePolicy = .accept,
     /// Optional callback invoked when a hook fails or returns
@@ -407,6 +449,12 @@ pub const Editor = struct {
     /// `null` when the previous render drew no hint.
     last_hint: ?CachedHint = null,
 
+    /// Live transient-input mode state (Ctrl-R search overlay).
+    /// `null` outside of transient mode. While non-null, key
+    /// dispatch and render route to alternate paths that operate
+    /// on `transient.query` instead of the main buffer.
+    transient: ?TransientState = null,
+
     pub fn init(allocator: Allocator, options: Options) !Editor {
         var editor: Editor = .{
             .allocator = allocator,
@@ -445,6 +493,7 @@ pub const Editor = struct {
         self.changeset.deinit();
         self.pending_keys.deinit(self.allocator);
         self.clearHintCache();
+        self.exitTransientMode();
     }
 
     /// Block until the user accepts, cancels, or sends EOF.
@@ -493,7 +542,10 @@ pub const Editor = struct {
         self.quoted_insert_pending = false;
         self.yank_last_arg = null;
         self.last_yank_start = 0;
-        try self.render(prompt);
+        // Each `readLine` starts with a clean transient state — a
+        // mode left dangling across iterations would be confusing.
+        self.exitTransientMode();
+        try self.renderActive(prompt);
 
         while (true) {
             const ev = self.reader.next();
@@ -504,29 +556,46 @@ pub const Editor = struct {
                     // it's processed. EOF still ends the loop, but a
                     // pending prefix gets a chance to dispatch first.
                     if (try self.flushPendingSequence(prompt)) |result| return result;
+                    // EOF mid-transient counts as an abort from the
+                    // hook's perspective: it allocated state in
+                    // `.opened` and now the mode is terminating
+                    // without accept. Notify best-effort.
+                    self.abortTransientBestEffort();
                     try self.renderer.finalize(&self.terminal);
                     if (self.options.history) |h| h.resetCursor();
                     return .eof;
                 },
                 .error_ => |e| {
+                    self.abortTransientBestEffort();
                     try self.renderer.finalize(&self.terminal);
                     return e;
                 },
                 .resize => {
                     if (try self.flushPendingSequence(prompt)) |result| return result;
-                    try self.render(prompt);
+                    try self.renderActive(prompt);
                 },
                 .paste => |payload| {
                     if (try self.flushPendingSequence(prompt)) |result| return result;
-                    try self.handlePaste(payload);
-                    try self.render(prompt);
+                    if (self.transient != null) {
+                        try self.handleTransientPaste(payload);
+                    } else {
+                        try self.handlePaste(payload);
+                    }
+                    try self.renderActive(prompt);
                 },
                 .key => |kev| {
-                    if (try self.handleKey(kev, prompt)) |result| {
-                        if (self.options.history) |h| h.resetCursor();
-                        return result;
+                    if (self.transient != null) {
+                        if (try self.handleKeyTransient(kev)) |result| {
+                            if (self.options.history) |h| h.resetCursor();
+                            return result;
+                        }
+                    } else {
+                        if (try self.handleKey(kev, prompt)) |result| {
+                            if (self.options.history) |h| h.resetCursor();
+                            return result;
+                        }
                     }
-                    try self.render(prompt);
+                    try self.renderActive(prompt);
                 },
             }
         }
@@ -574,6 +643,31 @@ pub const Editor = struct {
 
     fn render(self: *Editor, prompt: prompt_mod.Prompt) !void {
         return self.renderInternal(prompt, true);
+    }
+
+    /// Dispatch a render to either the transient overlay or the
+    /// normal prompt+buffer path, based on current mode. Used by
+    /// the read loop so callers don't have to remember the check.
+    fn renderActive(self: *Editor, prompt: prompt_mod.Prompt) !void {
+        if (self.transient != null) {
+            return self.renderTransient();
+        }
+        return self.render(prompt);
+    }
+
+    /// Sanitize a bracketed-paste payload and insert it into the
+    /// transient query. Newlines are turned into spaces (transient
+    /// queries are single-line by construction); invalid UTF-8 and
+    /// control bytes are rejected outright (no FFFD substitution
+    /// since the user is searching, not authoring text).
+    fn handleTransientPaste(self: *Editor, payload: []const u8) !void {
+        const sanitized = try sanitizePaste(self.allocator, payload);
+        defer self.allocator.free(sanitized);
+        if (sanitized.len == 0) return;
+        if (!std.unicode.utf8ValidateSlice(sanitized)) return;
+        if (buffer_mod.findUnsafeByte(sanitized) != null) return;
+        try self.transient.?.query.insertText(sanitized);
+        self.invokeTransientHook(.query_changed);
     }
 
     /// Render the prompt + buffer + (optional hint) frame.
@@ -680,6 +774,297 @@ pub const Editor = struct {
             self.last_hint = null;
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Transient input mode (Ctrl-R search overlay)
+    // -------------------------------------------------------------------------
+
+    /// Default status text rendered when the hook returns
+    /// `status = null`.
+    const transient_default_status: []const u8 = "(reverse-i-search): ";
+
+    /// Open transient mode. No-op if no hook is configured. Initializes
+    /// `self.transient`, clears any active hint cache + completion
+    /// state, breaks the changeset coalescing chain (so the line's
+    /// undo history won't merge with edits that happen after exit),
+    /// and invokes the hook with `.opened`.
+    fn handleTransientInputOpen(self: *Editor) !void {
+        if (self.options.transient_input == null) return;
+        if (self.transient != null) return; // already open; defensive
+
+        // UI submodes that share the prompt row don't survive Ctrl-R.
+        self.clearHintCache();
+        self.changeset.breakSequence();
+        self.kill_ring.reset();
+        self.yank_last_arg = null;
+
+        self.transient = .{
+            .query = buffer_mod.Buffer.init(self.allocator),
+            .original_cursor_byte = self.buffer.cursor_byte,
+        };
+        // Set width policy on the query buffer so wide-character
+        // queries render correctly.
+        self.transient.?.query.width_policy = self.options.width_policy;
+
+        self.invokeTransientHook(.opened);
+    }
+
+    /// Free the transient state. Idempotent. Does NOT touch the
+    /// main buffer (callers control whether to mutate).
+    fn exitTransientMode(self: *Editor) void {
+        if (self.transient) |*t| {
+            t.query.deinit();
+            if (t.last_preview) |p| self.allocator.free(p);
+            if (t.last_status) |s| self.allocator.free(s);
+            self.transient = null;
+        }
+    }
+
+    /// Notify the hook of an abort (best-effort) and exit transient
+    /// mode. Used for every user-abort path so the hook can clean
+    /// up its own state regardless of *why* the mode is closing —
+    /// Esc, Ctrl-G, Ctrl-C, EOF, or read error. A hook error from
+    /// the abort notification routes a diagnostic but does NOT
+    /// prevent the exit (per the documented contract: abort cannot
+    /// be vetoed).
+    fn abortTransientBestEffort(self: *Editor) void {
+        if (self.transient == null) return;
+        self.invokeTransientHook(.aborted);
+        self.exitTransientMode();
+    }
+
+    /// Call the transient hook with the supplied event, validate the
+    /// returned strings, and update the cached preview/status. Hook
+    /// errors and validation failures route to the diagnostic hook
+    /// and leave the previous cache values in place (so a transient
+    /// glitch doesn't visually wipe the user's last good preview).
+    fn invokeTransientHook(self: *Editor, event: transient_mod.TransientInputEvent) void {
+        const hook = self.options.transient_input orelse return;
+        const t = &self.transient.?;
+
+        const result = hook.update(.{
+            .original_buffer = self.buffer.slice(),
+            .original_cursor_byte = t.original_cursor_byte,
+            .query = t.query.slice(),
+            .query_cursor_byte = t.query.cursor_byte,
+            .event = event,
+        }) catch |err| {
+            self.diag(.{
+                .kind = .transient_input_hook_failed,
+                .err = err,
+                .detail = "transient_input hook returned error",
+            });
+            return;
+        };
+
+        // status is field-level: invalid → fall back to default but
+        // keep preview if it's valid.
+        if (result.status) |s| {
+            if (!std.unicode.utf8ValidateSlice(s)) {
+                self.diag(.{ .kind = .transient_input_invalid_text, .detail = "transient status not UTF-8" });
+            } else if (buffer_mod.findUnsafeByte(s) != null) {
+                self.diag(.{ .kind = .transient_input_invalid_text, .detail = "transient status contains control bytes" });
+            } else {
+                if (t.last_status) |old| self.allocator.free(old);
+                t.last_status = self.allocator.dupe(u8, s) catch null;
+            }
+        } else {
+            if (t.last_status) |old| self.allocator.free(old);
+            t.last_status = null;
+        }
+
+        // preview is field-level: invalid → drop, keep status. The
+        // three-state semantics (null/empty/non-empty) are preserved.
+        if (result.preview) |p| {
+            if (!std.unicode.utf8ValidateSlice(p)) {
+                self.diag(.{ .kind = .transient_input_invalid_text, .detail = "transient preview not UTF-8" });
+                if (t.last_preview) |old| self.allocator.free(old);
+                t.last_preview = null;
+            } else if (buffer_mod.findUnsafeByte(p) != null) {
+                self.diag(.{ .kind = .transient_input_invalid_text, .detail = "transient preview contains control bytes" });
+                if (t.last_preview) |old| self.allocator.free(old);
+                t.last_preview = null;
+            } else {
+                if (t.last_preview) |old| self.allocator.free(old);
+                t.last_preview = self.allocator.dupe(u8, p) catch null;
+            }
+        } else {
+            if (t.last_preview) |old| self.allocator.free(old);
+            t.last_preview = null;
+        }
+    }
+
+    /// Render the transient overlay by synthesizing prompt/buffer/
+    /// hint inputs and reusing `renderer.render`. Status acts as
+    /// the prompt prefix; query acts as the buffer; preview acts
+    /// as a dim ghost-text suffix. Width math, wrap, phantom-NL,
+    /// stale clearing all reuse the standard pipeline.
+    fn renderTransient(self: *Editor) !void {
+        var t = &self.transient.?;
+
+        const status_text: []const u8 = if (t.last_status) |s| s else transient_default_status;
+        const status_width = grapheme.displayWidth(status_text, self.options.width_policy) catch status_text.len;
+        const transient_prompt: prompt_mod.Prompt = .{
+            .bytes = status_text,
+            .width = status_width,
+        };
+
+        // Preview becomes a dim HintDraw. Empty preview ("") renders
+        // nothing — we skip the SGR pair entirely. Null preview also
+        // skips, distinguished only by accept semantics elsewhere.
+        var hint_draw: ?renderer_mod.HintDraw = null;
+        if (t.last_preview) |p| {
+            if (p.len > 0) {
+                const cols = grapheme.displayWidth(p, self.options.width_policy) catch p.len;
+                hint_draw = .{
+                    .text = p,
+                    .style = .{ .dim = true },
+                    .cols = cols,
+                };
+            }
+        }
+
+        try self.renderer.render(
+            &self.terminal,
+            transient_prompt,
+            &t.query,
+            &.{},
+            hint_draw,
+        );
+    }
+
+    /// Whitelist key dispatcher for transient mode. Returns a
+    /// `ReadLineResult` only on Ctrl-C (cancel_line). All other
+    /// outcomes return null and the read loop continues with a
+    /// transient-mode render.
+    ///
+    /// See module-level docs for the supported keys; everything
+    /// else is silently dropped (no hook call, no state change).
+    fn handleKeyTransient(
+        self: *Editor,
+        kev: input_mod.KeyEvent,
+    ) !?ReadLineResult {
+        var t = &self.transient.?;
+
+        switch (kev.code) {
+            .enter => {
+                // Accept: copy preview into main buffer (if any),
+                // exit mode. The line is NOT submitted — user must
+                // press Enter again to run.
+                const preview_owned: ?[]u8 = t.last_preview;
+                if (preview_owned) |p| {
+                    // One Replace undo step covers the buffer swap.
+                    const old = try self.allocator.dupe(u8, self.buffer.slice());
+                    defer self.allocator.free(old);
+                    const cursor_before = self.buffer.cursor_byte;
+                    try self.buffer.replaceAll(p);
+                    self.recordReplaceOrDiag(0, old, p, cursor_before, self.buffer.cursor_byte);
+                    self.changeset.breakSequence();
+                }
+                self.exitTransientMode();
+                return null;
+            },
+            .escape => {
+                self.abortTransientBestEffort();
+                return null;
+            },
+            .backspace => {
+                if (try t.query.deleteBackwardCluster()) |range| {
+                    self.allocator.free(range.bytes);
+                    self.invokeTransientHook(.query_changed);
+                }
+                return null;
+            },
+            .delete => {
+                if (try t.query.deleteForwardCluster()) |range| {
+                    self.allocator.free(range.bytes);
+                    self.invokeTransientHook(.query_changed);
+                }
+                return null;
+            },
+            .arrow_left => {
+                try t.query.moveLeftCluster();
+                return null;
+            },
+            .arrow_right => {
+                try t.query.moveRightCluster();
+                return null;
+            },
+            .home => {
+                t.query.moveToStart();
+                return null;
+            },
+            .end => {
+                t.query.moveToEnd();
+                return null;
+            },
+            .char => |c| {
+                if (kev.mods.ctrl) {
+                    return switch (c) {
+                        // Ctrl-G: same as Esc.
+                        'g' => blk: {
+                            self.abortTransientBestEffort();
+                            break :blk null;
+                        },
+                        // Ctrl-R again: advance to the next match.
+                        'r' => blk: {
+                            self.invokeTransientHook(.next);
+                            break :blk null;
+                        },
+                        // Ctrl-C: notify hook of abort, then cancel
+                        // the entire line. The user explicitly chose
+                        // to drop both the search and the buffer.
+                        'c' => blk: {
+                            self.abortTransientBestEffort();
+                            break :blk try self.cancelCurrentLine();
+                        },
+                        // Ctrl-A: query move-to-start.
+                        'a' => blk: {
+                            t.query.moveToStart();
+                            break :blk null;
+                        },
+                        // Ctrl-E: query move-to-end.
+                        'e' => blk: {
+                            t.query.moveToEnd();
+                            break :blk null;
+                        },
+                        // Ctrl-H: backspace synonym.
+                        'h' => blk: {
+                            if (try t.query.deleteBackwardCluster()) |range| {
+                                self.allocator.free(range.bytes);
+                                self.invokeTransientHook(.query_changed);
+                            }
+                            break :blk null;
+                        },
+                        // All other Ctrl- chords are dropped.
+                        else => null,
+                    };
+                }
+                if (kev.mods.alt) return null; // M- chords are dropped
+                if (c < 0x20) return null; // bare control bytes dropped
+                // Encode as UTF-8 and insert into the query buffer.
+                var buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(c, &buf) catch return null;
+                try t.query.insertText(buf[0..len]);
+                self.invokeTransientHook(.query_changed);
+                return null;
+            },
+            .text => |bytes| {
+                // Paste-like payloads. Sanitize via the same policy
+                // applied elsewhere.
+                if (!std.unicode.utf8ValidateSlice(bytes)) return null;
+                if (buffer_mod.findUnsafeByte(bytes) != null) return null;
+                if (bytes.len == 0) return null;
+                try t.query.insertText(bytes);
+                self.invokeTransientHook(.query_changed);
+                return null;
+            },
+            // Tab, function keys, page up/down, insert, arrow_up/down,
+            // unknown — no-op in transient mode.
+            else => return null,
+        }
+    }
+
 
     fn diag(self: *Editor, d: Diagnostic) void {
         if (self.options.diagnostic) |dh| dh.report(d);
@@ -1316,6 +1701,7 @@ pub const Editor = struct {
             .yank_last_arg => try self.handleYankLastArg(),
             .complete => try self.handleComplete(prompt),
             .accept_hint => try self.handleAcceptHint(),
+            .transient_input_open => try self.handleTransientInputOpen(),
             .accept_line => return try self.acceptCurrentLine(),
             .cancel_line => return try self.cancelCurrentLine(),
             .eof => {
@@ -3184,4 +3570,391 @@ test "editor: stale-hint clearing — wider prior frame fully cleared" {
     // produces a smaller `rows` value when the hint disappears so the
     // pre-existing clear path has more rows to wipe than to redraw.
     try std.testing.expect(lay1.rows > lay2.rows);
+}
+
+// =============================================================================
+// Transient input mode tests — verify the Ctrl-R overlay's state
+// machine, hook contract, and accept/abort semantics without driving
+// a real terminal.
+// =============================================================================
+
+const TransientTestCtx = struct {
+    /// Sequence of events the hook has been called with, in order.
+    events: [16]transient_mod.TransientInputEvent = undefined,
+    events_len: usize = 0,
+    /// What the hook returns next; tests set this before driving.
+    next_preview: ?[]const u8 = null,
+    next_status: ?[]const u8 = null,
+    /// Last-seen request fields for assertions.
+    last_query: [128]u8 = undefined,
+    last_query_len: usize = 0,
+    last_query_cursor: usize = 0,
+    last_original_cursor: usize = 0,
+    /// Optional error to inject (exercises the hook-failure diag path).
+    inject_err: ?anyerror = null,
+
+    fn cb(
+        ctx: *anyopaque,
+        request: transient_mod.TransientInputRequest,
+    ) anyerror!transient_mod.TransientInputResult {
+        const self: *TransientTestCtx = @ptrCast(@alignCast(ctx));
+        if (self.events_len < self.events.len) {
+            self.events[self.events_len] = request.event;
+            self.events_len += 1;
+        }
+        if (self.inject_err) |e| return e;
+        @memcpy(self.last_query[0..request.query.len], request.query);
+        self.last_query_len = request.query.len;
+        self.last_query_cursor = request.query_cursor_byte;
+        self.last_original_cursor = request.original_cursor_byte;
+        return .{ .preview = self.next_preview, .status = self.next_status };
+    }
+
+    fn hook(self: *TransientTestCtx) transient_mod.TransientInputHook {
+        return .{ .ctx = @ptrCast(self), .updateFn = cb };
+    }
+
+    fn lastQuery(self: *const TransientTestCtx) []const u8 {
+        return self.last_query[0..self.last_query_len];
+    }
+
+    fn eventsSlice(self: *const TransientTestCtx) []const transient_mod.TransientInputEvent {
+        return self.events[0..self.events_len];
+    }
+};
+
+fn devNullEditorWithTransient(
+    ctx: *TransientTestCtx,
+    diag_ctx: ?*DiagTestCtx,
+) !struct { editor: Editor, fd: c_int } {
+    const fd = openDevNullForWrite();
+    var opts: Options = .{
+        .raw_mode = .disabled,
+        .output_fd = fd,
+        .transient_input = ctx.hook(),
+    };
+    if (diag_ctx) |dc| opts.diagnostic = dc.hook();
+    const editor = try Editor.init(std.testing.allocator, opts);
+    return .{ .editor = editor, .fd = fd };
+}
+
+test "editor: transient_input_open initializes state and fires .opened" {
+    var ctx: TransientTestCtx = .{ .next_status = "search: " };
+    const setup = try devNullEditorWithTransient(&ctx, null);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    try editor.buffer.insertText("hello");
+    editor.buffer.cursor_byte = 3;
+
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    try std.testing.expect(editor.transient != null);
+    try std.testing.expectEqual(@as(usize, 1), ctx.events_len);
+    try std.testing.expect(ctx.events[0] == .opened);
+    try std.testing.expectEqual(@as(usize, 3), ctx.last_original_cursor);
+    // Status was applied.
+    try std.testing.expect(editor.transient.?.last_status != null);
+    try std.testing.expectEqualStrings("search: ", editor.transient.?.last_status.?);
+    // Main buffer is preserved.
+    try std.testing.expectEqualStrings("hello", editor.buffer.slice());
+}
+
+test "editor: transient_input_open is no-op when no hook is configured" {
+    var editor = try Editor.init(std.testing.allocator, .{ .raw_mode = .disabled });
+    defer editor.deinit();
+    try editor.buffer.insertText("untouched");
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    try std.testing.expect(editor.transient == null);
+    try std.testing.expectEqualStrings("untouched", editor.buffer.slice());
+}
+
+fn keyPrintable(c: u21) input_mod.KeyEvent {
+    return .{ .code = .{ .char = c } };
+}
+
+fn keyCtrl(c: u21) input_mod.KeyEvent {
+    return .{ .code = .{ .char = c }, .mods = .{ .ctrl = true } };
+}
+
+test "editor: transient query update fires .query_changed with current text" {
+    var ctx: TransientTestCtx = .{ .next_preview = "git checkout main" };
+    const setup = try devNullEditorWithTransient(&ctx, null);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    // Type 'g', 'i', 't' into the query.
+    _ = try editor.handleKeyTransient(keyPrintable('g'));
+    _ = try editor.handleKeyTransient(keyPrintable('i'));
+    _ = try editor.handleKeyTransient(keyPrintable('t'));
+
+    // 1 .opened + 3 .query_changed.
+    try std.testing.expectEqual(@as(usize, 4), ctx.events_len);
+    try std.testing.expect(ctx.events[1] == .query_changed);
+    try std.testing.expect(ctx.events[3] == .query_changed);
+    try std.testing.expectEqualStrings("git", ctx.lastQuery());
+    // Preview cached.
+    try std.testing.expectEqualStrings("git checkout main", editor.transient.?.last_preview.?);
+}
+
+test "editor: transient Ctrl-R while open fires .next" {
+    var ctx: TransientTestCtx = .{ .next_preview = "first" };
+    const setup = try devNullEditorWithTransient(&ctx, null);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyTransient(keyCtrl('r'));
+    _ = try editor.handleKeyTransient(keyCtrl('r'));
+
+    try std.testing.expectEqual(@as(usize, 3), ctx.events_len);
+    try std.testing.expect(ctx.events[1] == .next);
+    try std.testing.expect(ctx.events[2] == .next);
+    try std.testing.expect(editor.transient != null); // still in mode
+}
+
+test "editor: transient Enter with non-empty preview replaces buffer + records undo" {
+    var ctx: TransientTestCtx = .{ .next_preview = "git checkout main" };
+    const setup = try devNullEditorWithTransient(&ctx, null);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    try editor.buffer.insertText("original");
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    // Now press Enter.
+    _ = try editor.handleKeyTransient(.{ .code = .enter });
+
+    try std.testing.expect(editor.transient == null);
+    try std.testing.expectEqualStrings("git checkout main", editor.buffer.slice());
+
+    // Undo restores the original.
+    try editor.handleUndo();
+    try std.testing.expectEqualStrings("original", editor.buffer.slice());
+}
+
+test "editor: transient Enter with empty preview clears buffer" {
+    var ctx: TransientTestCtx = .{ .next_preview = "" };
+    const setup = try devNullEditorWithTransient(&ctx, null);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    try editor.buffer.insertText("anything");
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyTransient(.{ .code = .enter });
+
+    try std.testing.expect(editor.transient == null);
+    try std.testing.expectEqualStrings("", editor.buffer.slice());
+}
+
+test "editor: transient Enter with null preview is a no-op (stays open)" {
+    var ctx: TransientTestCtx = .{ .next_preview = null };
+    const setup = try devNullEditorWithTransient(&ctx, null);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    try editor.buffer.insertText("kept");
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyTransient(.{ .code = .enter });
+
+    try std.testing.expect(editor.transient == null);
+    try std.testing.expectEqualStrings("kept", editor.buffer.slice());
+}
+
+test "editor: transient Esc fires .aborted and leaves buffer untouched" {
+    var ctx: TransientTestCtx = .{ .next_preview = "would-be-replacement" };
+    const setup = try devNullEditorWithTransient(&ctx, null);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    try editor.buffer.insertText("untouched");
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyTransient(.{ .code = .escape });
+
+    try std.testing.expect(editor.transient == null);
+    try std.testing.expectEqualStrings("untouched", editor.buffer.slice());
+
+    var saw_aborted = false;
+    for (ctx.eventsSlice()) |e| {
+        if (e == .aborted) saw_aborted = true;
+    }
+    try std.testing.expect(saw_aborted);
+}
+
+test "editor: transient Ctrl-G fires .aborted (Esc synonym)" {
+    var ctx: TransientTestCtx = .{};
+    const setup = try devNullEditorWithTransient(&ctx, null);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    try editor.buffer.insertText("preserve");
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyTransient(keyCtrl('g'));
+
+    try std.testing.expect(editor.transient == null);
+    try std.testing.expectEqualStrings("preserve", editor.buffer.slice());
+
+    var saw_aborted = false;
+    for (ctx.eventsSlice()) |e| {
+        if (e == .aborted) saw_aborted = true;
+    }
+    try std.testing.expect(saw_aborted);
+}
+
+test "editor: transient Ctrl-C exits transient and cancels line" {
+    var ctx: TransientTestCtx = .{};
+    const setup = try devNullEditorWithTransient(&ctx, null);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    try editor.buffer.insertText("abandoned");
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    const result = try editor.handleKeyTransient(keyCtrl('c'));
+
+    try std.testing.expect(editor.transient == null);
+    try std.testing.expect(result != null);
+    try std.testing.expect(result.? == .interrupt);
+    try std.testing.expectEqualStrings("", editor.buffer.slice());
+
+    // Ctrl-C also fires .aborted so the hook can clean up state
+    // it allocated on .opened (matches Esc / Ctrl-G / EOF behavior).
+    var saw_aborted = false;
+    for (ctx.eventsSlice()) |e| {
+        if (e == .aborted) saw_aborted = true;
+    }
+    try std.testing.expect(saw_aborted);
+}
+
+test "editor: transient cursor-aware editing via Left + insert" {
+    var ctx: TransientTestCtx = .{};
+    const setup = try devNullEditorWithTransient(&ctx, null);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyTransient(keyPrintable('a'));
+    _ = try editor.handleKeyTransient(keyPrintable('c'));
+    _ = try editor.handleKeyTransient(.{ .code = .arrow_left });
+    _ = try editor.handleKeyTransient(keyPrintable('b'));
+
+    // Query is "abc"; cursor at byte 2 after the insertion.
+    try std.testing.expectEqualStrings("abc", editor.transient.?.query.slice());
+    try std.testing.expectEqual(@as(usize, 2), editor.transient.?.query.cursor_byte);
+    // Hook saw the latest update with cursor byte 2.
+    try std.testing.expectEqual(@as(usize, 2), ctx.last_query_cursor);
+}
+
+test "editor: transient invalid preview drops to null, valid status kept" {
+    var diag: DiagTestCtx = .{};
+    var ctx: TransientTestCtx = .{ .next_preview = "bad\x1bdata", .next_status = "(valid status): " };
+    const setup = try devNullEditorWithTransient(&ctx, &diag);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    try std.testing.expect(editor.transient.?.last_preview == null);
+    try std.testing.expectEqualStrings("(valid status): ", editor.transient.?.last_status.?);
+    try std.testing.expect(diag.count >= 1);
+    try std.testing.expectEqual(
+        @as(?Diagnostic.Kind, .transient_input_invalid_text),
+        diag.last_kind,
+    );
+}
+
+test "editor: transient invalid status falls back to null, valid preview kept" {
+    var diag: DiagTestCtx = .{};
+    var ctx: TransientTestCtx = .{ .next_preview = "good", .next_status = "bad\x1bstatus" };
+    const setup = try devNullEditorWithTransient(&ctx, &diag);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("good", editor.transient.?.last_preview.?);
+    try std.testing.expect(editor.transient.?.last_status == null);
+    try std.testing.expect(diag.count >= 1);
+}
+
+test "editor: transient hook error fires diagnostic, leaves last cache intact" {
+    var diag: DiagTestCtx = .{};
+    var ctx: TransientTestCtx = .{
+        .next_preview = "first match",
+        .next_status = null,
+    };
+    const setup = try devNullEditorWithTransient(&ctx, &diag);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("first match", editor.transient.?.last_preview.?);
+
+    // Now make subsequent hook calls fail; type a char.
+    ctx.inject_err = error.RankerCrashed;
+    _ = try editor.handleKeyTransient(keyPrintable('x'));
+
+    try std.testing.expect(diag.count >= 1);
+    try std.testing.expectEqual(
+        @as(?Diagnostic.Kind, .transient_input_hook_failed),
+        diag.last_kind,
+    );
+    // Previous preview is preserved (not wiped by the failed call).
+    try std.testing.expectEqualStrings("first match", editor.transient.?.last_preview.?);
+}
+
+test "editor: normal typing after transient exit edits main buffer" {
+    var ctx: TransientTestCtx = .{ .next_preview = "preview" };
+    const setup = try devNullEditorWithTransient(&ctx, null);
+    var editor = setup.editor;
+    defer {
+        editor.deinit();
+        _ = std.c.close(setup.fd);
+    }
+
+    _ = try editor.dispatch(.transient_input_open, prompt_mod.Prompt.plain(""));
+    // Abort.
+    _ = try editor.handleKeyTransient(.{ .code = .escape });
+    try std.testing.expect(editor.transient == null);
+
+    // Now use the normal handleKeyDirect path (simulating post-exit
+    // typing). The action goes to main buffer.
+    _ = try editor.handleKeyDirect(keyPrintable('a'), prompt_mod.Prompt.plain(""));
+    _ = try editor.handleKeyDirect(keyPrintable('b'), prompt_mod.Prompt.plain(""));
+    try std.testing.expectEqualStrings("ab", editor.buffer.slice());
 }
