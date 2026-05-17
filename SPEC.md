@@ -850,12 +850,12 @@ ANSI-emitting function and returns it as a single-span no-op
 (rendering ANSI passthrough). This is documented as a foot-gun and
 discouraged; the spans API is primary.
 
-### §6.5 Multi-column completion menu (v0.2.x)
+### §6.5 Multi-column completion menu (v0.7.0 — shipped)
 
-The v0.x renderer prints multi-candidate completion results on a
-single line, space-separated, beneath the prompt. That's an explicit
-placeholder — works for 3 candidates, broken for 30, unusable for
-300. v0.2.x replaces it with a real menu.
+The v0.x renderer printed multi-candidate completion results on a
+single line, space-separated, beneath the prompt. That worked for
+3 candidates, broke for 30, was unusable for 300. v0.7.0 replaced
+it with a real menu (this section).
 
 **Defaults** (informed by slash's deployment-style biases — confirmed
 by slash AI's pre-emptive flags):
@@ -960,26 +960,25 @@ shapes carry everything the menu needs.
 - Mouse selection. Mouse input is itself a future item.
 - Per-candidate styling beyond the existing `description` field.
 
-**Open questions for slash review** (these specifically benefit
-from real-usage feedback, not abstract preference):
+**Slash review outcomes** (v0.7.0):
 
-1. **Buffer preview vs frozen buffer.** Default is preview (mutate
-   in-place during nav). Is that the right default for slash users,
-   or would frozen + preview-only-on-Enter be less disruptive?
-   Concrete scenario: long history search where the user is
-   skimming candidates without committing — does preview-mutate
-   feel "responsive" or "thrashing"?
-2. **Page-size default.** `min(rows/2, 10)`. Too small for
-   filesystem completion in deep trees? Too big for short prompts
-   in narrow terminals? Slash usage will reveal.
-3. **Description threshold.** "Show descriptions when ≥ half the
-   terminal width is free after the candidate column." Is half
-   the right cutoff, or is description compression / truncation
-   a better fallback than omission?
-4. **Truncation character.** Default is `…` (single-cluster
-   ellipsis). Some terminals render it weirdly with non-monospace
-   fonts. Should we have a `Options.completion_menu.truncation:
-   []const u8 = "…"` knob, or hold the line on Unicode?
+1. **Buffer preview vs frozen buffer**: **preview**. Matches
+   zsh menu-select / fish defaults; the slash user said "preview
+   feels right." Cursor lands at end of `insert + append` so
+   "any other key" reprocessing continues naturally.
+2. **Page-size default**: `min(rows/2, 10)` shipped as-is.
+   PageDown/PageUp covers the long tail.
+3. **Descriptive vs grid mode**: **GPT-5.5 catch.** The original
+   sketch mixed descriptions into grid columns; that would have
+   given dense names + omitted descriptions, defeating the purpose.
+   Shipped instead as a binary mode pick: descriptive single-column
+   mode (one row per candidate, description in dim column) when the
+   description column would have ≥ `min_desc_cols` = **20 cells**
+   free; grid multi-column mode (names only, no descriptions) when
+   not. The threshold dropped from "≥ half the terminal width free"
+   to "20 cells" so descriptions actually surface on modern wide
+   terminals.
+4. **Truncation character**: `…` hard-coded. No knob.
 
 ### §6.6 Menu dispatch state machine
 
@@ -1663,14 +1662,12 @@ implementations in `misc/`; both are bounded scope.
   shipped with zigline v0.1.5 embedded; v0.1.6 + v0.2.0 land into
   slash via the same path-dep mechanism with no observed
   regressions.
-- ⏳ **Multi-column completion menu UI** (designed in §6.5 / §6.6 /
-  §6.7; pending slash review of the four open questions before
-  code lands). Replaces the v0.x single-line space-separated
-  placeholder with a columnar layout sized to terminal width,
-  paged for overflow, keyboard-navigable. Reference:
-  `reedline/src/menu/columnar_menu.rs::create_string`. We lift the
-  layout math; we don't lift the trait abstraction (zigline ships
-  one menu type, not three).
+- ✅ **Multi-column completion menu UI** (shipped in v0.7.0; see
+  §6.5 / §6.6 / §6.7). Replaces the v0.x single-line space-
+  separated placeholder. Auto-picks descriptive single-column mode
+  (when room ≥ 20 cells exists for descriptions) or grid multi-
+  column mode (when not). Inline preview with `Esc` restore;
+  one whole-buffer Replace undo step on accept. `Options.completion_menu = null` disables (escape hatch).
 
 ### v0.x continuing additions (non-breaking)
 

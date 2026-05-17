@@ -28,10 +28,12 @@
 const std = @import("std");
 
 const buffer_mod = @import("buffer.zig");
+const completion_mod = @import("completion.zig");
 const grapheme = @import("grapheme.zig");
 const highlight = @import("highlight.zig");
 const prompt_mod = @import("prompt.zig");
 const terminal_mod = @import("terminal.zig");
+
 
 pub const Allocator = std.mem.Allocator;
 
@@ -103,6 +105,186 @@ pub const HintDraw = struct {
     cols: usize,
 };
 
+/// Completion menu draw payload. The editor passes this when
+/// `menu_state != null`; the renderer paints it below the prompt+buffer.
+/// Hint and menu are mutually exclusive (the renderer asserts).
+pub const MenuDraw = struct {
+    /// Candidate slice — borrowed from `Editor.menu_state.candidates`.
+    /// Valid for the duration of the render call.
+    candidates: []const completion_mod.Candidate,
+    /// Index of the currently-previewed selection. Rendered in
+    /// reverse video.
+    selected_idx: usize,
+    /// User-configured menu options (max_rows, show_descriptions).
+    options: completion_mod.CompletionMenuOptions,
+};
+
+/// Pure layout math for the completion menu, broken out for unit
+/// testing without a terminal. See SPEC.md §6.5.
+///
+/// Two modes:
+///
+///   - `.descriptive`: when `show_descriptions` is on, at least one
+///     candidate carries a non-null description, AND the terminal is
+///     wide enough that the description column has at least
+///     `min_desc_cols` cells, render ONE candidate per row with the
+///     description in dim style to the right.
+///
+///   - `.grid`: pack candidates into a multi-column grid sized to the
+///     longest label. No descriptions shown. Page size =
+///     `visible_rows * visible_cols`.
+pub const MenuLayout = struct {
+    pub const Mode = enum { descriptive, grid };
+
+    /// Minimum width (in cells) the description column must have for
+    /// descriptive mode to apply. Below this, fall back to grid mode.
+    /// Tuned for "git/docker/kubectl-class CLIs on 100+ col terminals."
+    pub const min_desc_cols: usize = 20;
+
+    /// Gap (in cells) between the candidate label column and the
+    /// description (descriptive mode) or the next column (grid mode).
+    pub const col_gap: usize = 2;
+
+    mode: Mode,
+    /// Live terminal dimensions used to compute everything below.
+    term_cols: usize,
+    term_rows: usize,
+    /// How many candidate rows fit per page (mode-dependent).
+    visible_rows: usize,
+    /// In grid mode, how many candidate columns fit. In descriptive
+    /// mode, always 1.
+    visible_cols: usize,
+    /// `visible_rows * visible_cols`. The PageDown / PageUp stride.
+    page_size: usize,
+    /// First candidate index displayed on the current page (derived
+    /// from `selected_idx`).
+    page_offset: usize,
+    /// Width of the label column in cells (max display width of
+    /// candidates on the page, capped at `term_cols`).
+    label_width: usize,
+    /// Width of the description column in cells (descriptive mode
+    /// only; 0 in grid mode).
+    desc_width: usize,
+    /// Total rows the menu occupies, INCLUDING the optional pager
+    /// indicator row.
+    menu_rows: usize,
+    /// True when candidates.len > page_size and we should render the
+    /// `(N/M)` pager indicator below the menu.
+    show_pager: bool,
+
+    pub fn compute(
+        candidates: []const completion_mod.Candidate,
+        selected_idx: usize,
+        term_cols: usize,
+        term_rows: usize,
+        opts: completion_mod.CompletionMenuOptions,
+        width_policy: grapheme.WidthPolicy,
+    ) MenuLayout {
+        std.debug.assert(term_cols > 0);
+        std.debug.assert(candidates.len > 0);
+
+        // Page-size cap derived from terminal rows: don't consume
+        // more than half the terminal by default; also cap at 10
+        // rows so the menu never feels overwhelming.
+        const default_max: usize = blk: {
+            const half = term_rows / 2;
+            break :blk if (half == 0) 1 else @min(half, @as(usize, 10));
+        };
+        const max_rows = if (opts.max_rows) |m| (if (m == 0) 1 else m) else default_max;
+
+        // Compute the longest candidate label width across ALL
+        // candidates (not just visible). Stable layout across pages.
+        var max_label: usize = 0;
+        var any_desc = false;
+        for (candidates) |c| {
+            const label = c.display orelse c.insert;
+            const w = grapheme.displayWidth(label, width_policy) catch label.len;
+            if (w > max_label) max_label = w;
+            if (c.description) |d| {
+                if (d.len > 0) any_desc = true;
+            }
+        }
+
+        // Cap label width at term_cols - 2 (one-cell margin each side
+        // per spec). Truncation happens at draw time.
+        const usable = if (term_cols >= 2) term_cols - 2 else term_cols;
+        const label_w_capped = @min(max_label, usable);
+
+        // Decide mode.
+        const want_descriptive = opts.show_descriptions and any_desc;
+        const has_desc_room = usable > label_w_capped + col_gap + min_desc_cols;
+        const mode: Mode = if (want_descriptive and has_desc_room) .descriptive else .grid;
+
+        return switch (mode) {
+            .descriptive => computeDescriptive(candidates, selected_idx, max_rows, term_cols, term_rows, usable, label_w_capped),
+            .grid => computeGrid(candidates, selected_idx, max_rows, term_cols, term_rows, usable, label_w_capped),
+        };
+    }
+
+    fn computeDescriptive(
+        candidates: []const completion_mod.Candidate,
+        selected_idx: usize,
+        max_rows: usize,
+        term_cols: usize,
+        term_rows: usize,
+        usable: usize,
+        label_w: usize,
+    ) MenuLayout {
+        const visible_rows = @min(candidates.len, max_rows);
+        const page_size = visible_rows;
+        const page_offset = (selected_idx / page_size) * page_size;
+        const desc_width = if (usable > label_w + col_gap) usable - label_w - col_gap else 0;
+        const show_pager = candidates.len > page_size;
+        const menu_rows = visible_rows + (if (show_pager) @as(usize, 1) else 0);
+        return .{
+            .mode = .descriptive,
+            .term_cols = term_cols,
+            .term_rows = term_rows,
+            .visible_rows = visible_rows,
+            .visible_cols = 1,
+            .page_size = page_size,
+            .page_offset = page_offset,
+            .label_width = label_w,
+            .desc_width = desc_width,
+            .menu_rows = menu_rows,
+            .show_pager = show_pager,
+        };
+    }
+
+    fn computeGrid(
+        candidates: []const completion_mod.Candidate,
+        selected_idx: usize,
+        max_rows: usize,
+        term_cols: usize,
+        term_rows: usize,
+        usable: usize,
+        label_w: usize,
+    ) MenuLayout {
+        // Column width = label + gap. Visible columns = floor(usable / col_w).
+        const col_w = label_w + col_gap;
+        const cols = if (col_w == 0) 1 else @max(@as(usize, 1), usable / col_w);
+        const rows_full = (candidates.len + cols - 1) / cols;
+        const visible_rows = @min(rows_full, max_rows);
+        const page_size = visible_rows * cols;
+        const page_offset = if (page_size == 0) 0 else (selected_idx / page_size) * page_size;
+        const show_pager = candidates.len > page_size;
+        const menu_rows = visible_rows + (if (show_pager) @as(usize, 1) else 0);
+        return .{
+            .mode = .grid,
+            .term_cols = term_cols,
+            .term_rows = term_rows,
+            .visible_rows = visible_rows,
+            .visible_cols = cols,
+            .page_size = page_size,
+            .page_offset = page_offset,
+            .label_width = label_w,
+            .desc_width = 0,
+            .menu_rows = menu_rows,
+            .show_pager = show_pager,
+        };
+    }
+};
+
 pub const Renderer = struct {
     allocator: Allocator,
     width_policy: grapheme.WidthPolicy,
@@ -162,7 +344,12 @@ pub const Renderer = struct {
         buffer: *buffer_mod.Buffer,
         spans: []const highlight.HighlightSpan,
         hint: ?HintDraw,
+        menu: ?MenuDraw,
     ) !void {
+        // Hint and menu are mutually exclusive. The editor enforces
+        // this at the dispatch layer; the assertion catches API
+        // violations during testing without changing release behavior.
+        std.debug.assert(!(hint != null and menu != null));
         try buffer.ensureClusters();
         const size = terminal.querySize();
         const cols: usize = if (size.cols == 0) 80 else size.cols;
@@ -241,12 +428,41 @@ pub const Renderer = struct {
         // Step 4 — phantom-newline fix for the autowrap edge case.
         if (layout.needs_phantom_nl) try w.writeAll("\n\r");
 
-        // Step 5 — move cursor to (cursor_row, cursor_col).
-        const end_row: usize = if (layout.needs_phantom_nl) layout.rows else layout.rows - 1;
-        if (end_row > layout.cursor_row) {
-            try w.print("\x1b[{d}A", .{end_row - layout.cursor_row});
-        } else if (layout.cursor_row > end_row) {
-            try w.print("\x1b[{d}B", .{layout.cursor_row - end_row});
+        // Step 4b — completion menu (drawn below the buffer). When
+        // present, the menu's rows are part of this render's tracked
+        // frame (counted in `last_rows`), so the next `render`
+        // automatically clears them.
+        var menu_rows_drawn: usize = 0;
+        if (menu) |m| {
+            const menu_layout = MenuLayout.compute(
+                m.candidates,
+                m.selected_idx,
+                cols,
+                if (size.rows == 0) 24 else size.rows,
+                m.options,
+                self.width_policy,
+            );
+            // Drop to the row below the buffer if we're not already
+            // there (phantom_nl already put us at column 0 of the
+            // next row; otherwise we're at end-of-buffer mid-row).
+            if (!layout.needs_phantom_nl) try w.writeAll("\r\n");
+            try writeMenu(w, m, menu_layout, self.width_policy);
+            menu_rows_drawn = menu_layout.menu_rows;
+        }
+
+        // Step 5 — move cursor to (cursor_row, cursor_col). When the
+        // menu was drawn, we're at column 0 of the last menu row and
+        // need to climb up past both the menu and the lower buffer
+        // rows to land on the buffer's cursor row.
+        const buffer_end_row: usize = if (layout.needs_phantom_nl) layout.rows else layout.rows - 1;
+        const final_end_row: usize = if (menu_rows_drawn > 0)
+            buffer_end_row + menu_rows_drawn
+        else
+            buffer_end_row;
+        if (final_end_row > layout.cursor_row) {
+            try w.print("\x1b[{d}A", .{final_end_row - layout.cursor_row});
+        } else if (layout.cursor_row > final_end_row) {
+            try w.print("\x1b[{d}B", .{layout.cursor_row - final_end_row});
         }
         try w.writeByte('\r');
         if (layout.cursor_col > 0) {
@@ -255,7 +471,7 @@ pub const Renderer = struct {
 
         try terminal.writeAll(aw.written());
 
-        self.last_rows = layout.rows;
+        self.last_rows = layout.rows + menu_rows_drawn;
         self.last_cursor_row = layout.cursor_row;
     }
 
@@ -482,6 +698,178 @@ fn writeBuffer(
     if (active != null) try w.writeAll("\x1b[0m");
 }
 
+/// Render the completion menu rows. Cursor starts at column 0 of
+/// the first menu row; ends at column 0 of the last menu row.
+/// Selected candidate is rendered in reverse video. In descriptive
+/// mode each row carries `label  description` (description in dim).
+/// In grid mode rows pack multiple labels per row, padded to
+/// `label_width`. Pager row (when present) renders `(N/M)`.
+fn writeMenu(
+    w: *std.Io.Writer,
+    menu: MenuDraw,
+    layout: MenuLayout,
+    width_policy: grapheme.WidthPolicy,
+) !void {
+    const n = menu.candidates.len;
+    const page_end = @min(layout.page_offset + layout.page_size, n);
+
+    switch (layout.mode) {
+        .descriptive => {
+            var i: usize = layout.page_offset;
+            while (i < page_end) : (i += 1) {
+                const cand = menu.candidates[i];
+                const is_selected = i == menu.selected_idx;
+                if (is_selected) try w.writeAll("\x1b[7m");
+                try writeSafeLabel(w, cand.display orelse cand.insert, layout.label_width, width_policy);
+                if (is_selected) try w.writeAll("\x1b[27m");
+
+                if (cand.description) |desc| {
+                    if (desc.len > 0 and layout.desc_width > 0) {
+                        try w.writeAll("  ");
+                        try w.writeAll("\x1b[2m");
+                        try writeSafeLabel(w, desc, layout.desc_width, width_policy);
+                        try w.writeAll("\x1b[22m");
+                    }
+                }
+                if (i + 1 < page_end or layout.show_pager) {
+                    try w.writeAll("\r\n");
+                }
+            }
+        },
+        .grid => {
+            const cols = layout.visible_cols;
+            const col_w = layout.label_width + MenuLayout.col_gap;
+            const visible_rows = layout.visible_rows;
+            // Column-major (page_offset + col*visible_rows + row).
+            var row: usize = 0;
+            while (row < visible_rows) : (row += 1) {
+                var col: usize = 0;
+                while (col < cols) : (col += 1) {
+                    const idx = layout.page_offset + col * visible_rows + row;
+                    if (idx >= n or idx >= page_end) break;
+                    const cand = menu.candidates[idx];
+                    const is_selected = idx == menu.selected_idx;
+                    if (is_selected) try w.writeAll("\x1b[7m");
+                    try writeSafeLabel(w, cand.display orelse cand.insert, layout.label_width, width_policy);
+                    if (is_selected) try w.writeAll("\x1b[27m");
+                    if (col + 1 < cols and (layout.page_offset + (col + 1) * visible_rows + row) < page_end) {
+                        // Pad gap between columns.
+                        var g: usize = 0;
+                        while (g < MenuLayout.col_gap) : (g += 1) try w.writeByte(' ');
+                        _ = col_w;
+                    }
+                }
+                if (row + 1 < visible_rows or layout.show_pager) {
+                    try w.writeAll("\r\n");
+                }
+            }
+        },
+    }
+
+    if (layout.show_pager) {
+        const pages = (n + layout.page_size - 1) / layout.page_size;
+        const current_page = (layout.page_offset / layout.page_size) + 1;
+        var buf: [32]u8 = undefined;
+        const pager = try std.fmt.bufPrint(&buf, "({d}/{d})", .{ current_page, pages });
+        // Right-align pager inside term_cols. Simple: just print at
+        // column 0 of the dedicated pager row. Right-alignment is a
+        // nice-to-have but more terminal math than v1 needs.
+        try w.writeAll("\x1b[2m");
+        try w.writeAll(pager);
+        try w.writeAll("\x1b[22m");
+    }
+}
+
+/// Write a label sanitized of control/escape bytes, padded with
+/// spaces to `target_cols`, and truncated with `…` if it exceeds.
+/// `target_cols` of 0 means "write as much as is safe without
+/// padding or truncation."
+fn writeSafeLabel(
+    w: *std.Io.Writer,
+    label: []const u8,
+    target_cols: usize,
+    width_policy: grapheme.WidthPolicy,
+) !void {
+    const display_w = grapheme.displayWidth(label, width_policy) catch label.len;
+    if (target_cols > 0 and display_w > target_cols) {
+        // Truncate to fit. Use ellipsis as a marker.
+        // Conservative: walk bytes and stop one column short to make
+        // room for `…` (3-byte UTF-8, 1 display column).
+        if (target_cols < 2) {
+            // No room for sensible truncation; emit a single '…'.
+            try w.writeAll("\xe2\x80\xa6");
+            var p: usize = 0;
+            while (p + 1 < target_cols) : (p += 1) try w.writeByte(' ');
+            return;
+        }
+        const limit = target_cols - 1;
+        var byte_idx: usize = 0;
+        var col_count: usize = 0;
+        var iter = std.unicode.Utf8Iterator{ .bytes = label, .i = 0 };
+        while (iter.nextCodepointSlice()) |slc| {
+            const cp_w = grapheme.displayWidth(slc, width_policy) catch slc.len;
+            if (col_count + cp_w > limit) break;
+            byte_idx = iter.i;
+            col_count += cp_w;
+        }
+        try writeSafeText(w, label[0..byte_idx]);
+        try w.writeAll("\xe2\x80\xa6");
+        var pad: usize = col_count + 1;
+        while (pad < target_cols) : (pad += 1) try w.writeByte(' ');
+        return;
+    }
+    try writeSafeText(w, label);
+    if (target_cols > display_w) {
+        var pad: usize = display_w;
+        while (pad < target_cols) : (pad += 1) try w.writeByte(' ');
+    }
+}
+
+/// Write `bytes` after sanitizing control bytes (C0, DEL, C1) to
+/// `?`. Mirrors `Editor.writeCompletionLabel` so menu rendering is
+/// safe against hostile candidate strings.
+fn writeSafeText(w: *std.Io.Writer, bytes: []const u8) !void {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const b = bytes[i];
+        if (b < 0x20 or b == 0x7f) {
+            try w.writeByte('?');
+            i += 1;
+            continue;
+        }
+        if (b < 0x80) {
+            try w.writeByte(b);
+            i += 1;
+            continue;
+        }
+        // UTF-8 multibyte: validate the sequence; if valid AND the
+        // codepoint isn't C1, pass through.
+        const seq_len = std.unicode.utf8ByteSequenceLength(b) catch {
+            try w.writeByte('?');
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > bytes.len) {
+            try w.writeByte('?');
+            i += 1;
+            continue;
+        }
+        const seq = bytes[i .. i + seq_len];
+        const cp = std.unicode.utf8Decode(seq) catch {
+            try w.writeByte('?');
+            i += 1;
+            continue;
+        };
+        if (cp >= 0x80 and cp <= 0x9F) {
+            try w.writeByte('?');
+            i += seq_len;
+            continue;
+        }
+        try w.writeAll(seq);
+        i += seq_len;
+    }
+}
+
 fn writeSgrOpen(w: *std.Io.Writer, style: highlight.Style) !void {
     try w.writeAll("\x1b[");
     var first = true;
@@ -528,6 +916,110 @@ fn writeColorCode(w: *std.Io.Writer, c: highlight.Color, fg: bool) !void {
         .indexed => |idx| try w.print("{d};5;{d}", .{ base + 8, idx }),
         .rgb => |rgb| try w.print("{d};2;{d};{d};{d}", .{ base + 8, rgb.r, rgb.g, rgb.b }),
     }
+}
+
+// =============================================================
+// MenuLayout — pure layout math, unit-testable without a terminal
+// =============================================================
+
+const test_width_policy = grapheme.WidthPolicy{};
+
+fn mkCandidate(insert: []const u8, desc: ?[]const u8) completion_mod.Candidate {
+    return .{ .insert = insert, .description = desc };
+}
+
+test "menu layout: descriptive mode when room exists" {
+    const cands = [_]completion_mod.Candidate{
+        mkCandidate("--abbrev", "show only a partial prefix"),
+        mkCandidate("--abbrev-commit", "Show a prefix that names the object uniquely"),
+        mkCandidate("--after", "Show commits more recent than a specific date"),
+    };
+    const opts = completion_mod.CompletionMenuOptions{};
+    const layout = MenuLayout.compute(&cands, 0, 120, 24, opts, test_width_policy);
+    try std.testing.expectEqual(MenuLayout.Mode.descriptive, layout.mode);
+    try std.testing.expectEqual(@as(usize, 1), layout.visible_cols);
+    try std.testing.expectEqual(@as(usize, 3), layout.visible_rows);
+    try std.testing.expect(layout.desc_width >= MenuLayout.min_desc_cols);
+}
+
+test "menu layout: grid mode when no descriptions" {
+    const cands = [_]completion_mod.Candidate{
+        mkCandidate("add", null),
+        mkCandidate("bisect", null),
+        mkCandidate("branch", null),
+        mkCandidate("checkout", null),
+    };
+    const opts = completion_mod.CompletionMenuOptions{};
+    const layout = MenuLayout.compute(&cands, 0, 80, 24, opts, test_width_policy);
+    try std.testing.expectEqual(MenuLayout.Mode.grid, layout.mode);
+    try std.testing.expectEqual(@as(usize, 0), layout.desc_width);
+    try std.testing.expect(layout.visible_cols >= 1);
+}
+
+test "menu layout: grid mode when terminal too narrow for descriptions" {
+    const cands = [_]completion_mod.Candidate{
+        mkCandidate("--exclude-promisor-objects", "a description"),
+        mkCandidate("--exclude-first-parent-only", "another description"),
+    };
+    const opts = completion_mod.CompletionMenuOptions{};
+    // Label width ~27, +gap = 29; usable = 38 (40 - 2). Room = 9 < 20.
+    const layout = MenuLayout.compute(&cands, 0, 40, 24, opts, test_width_policy);
+    try std.testing.expectEqual(MenuLayout.Mode.grid, layout.mode);
+}
+
+test "menu layout: descriptions disabled by option" {
+    const cands = [_]completion_mod.Candidate{
+        mkCandidate("--abbrev", "show only a partial prefix"),
+        mkCandidate("--all", "all branches"),
+    };
+    const opts = completion_mod.CompletionMenuOptions{ .show_descriptions = false };
+    const layout = MenuLayout.compute(&cands, 0, 120, 24, opts, test_width_policy);
+    try std.testing.expectEqual(MenuLayout.Mode.grid, layout.mode);
+}
+
+test "menu layout: pagination kicks in past max_rows" {
+    var cands_buf: [25]completion_mod.Candidate = undefined;
+    inline for (0..25) |i| {
+        cands_buf[i] = .{ .insert = "x", .description = "y" };
+    }
+    const opts = completion_mod.CompletionMenuOptions{ .max_rows = 10 };
+    const layout = MenuLayout.compute(&cands_buf, 0, 120, 24, opts, test_width_policy);
+    try std.testing.expectEqual(@as(usize, 10), layout.visible_rows);
+    try std.testing.expectEqual(@as(usize, 10), layout.page_size);
+    try std.testing.expect(layout.show_pager);
+    // First page covers idx 0..9
+    try std.testing.expectEqual(@as(usize, 0), layout.page_offset);
+    // 11-row menu region (10 candidates + pager indicator row).
+    try std.testing.expectEqual(@as(usize, 11), layout.menu_rows);
+}
+
+test "menu layout: page_offset tracks selected_idx" {
+    var cands_buf: [30]completion_mod.Candidate = undefined;
+    inline for (0..30) |i| {
+        cands_buf[i] = .{ .insert = "x", .description = "y" };
+    }
+    const opts = completion_mod.CompletionMenuOptions{ .max_rows = 10 };
+    // selected_idx=12 → page 1 (covers 10..19)
+    const layout = MenuLayout.compute(&cands_buf, 12, 120, 24, opts, test_width_policy);
+    try std.testing.expectEqual(@as(usize, 10), layout.page_offset);
+}
+
+test "menu layout: max_rows default scales with term rows" {
+    const cands = [_]completion_mod.Candidate{
+        mkCandidate("a", null),
+        mkCandidate("b", null),
+        mkCandidate("c", null),
+    };
+    const opts = completion_mod.CompletionMenuOptions{};
+    // Tiny terminal: max_rows = min(rows/2, 10) = min(3, 10) = 3.
+    const layout = MenuLayout.compute(&cands, 0, 80, 6, opts, test_width_policy);
+    try std.testing.expect(layout.visible_rows <= 3);
+}
+
+test "menu layout: empty options inherits defaults" {
+    const cands = [_]completion_mod.Candidate{ mkCandidate("a", null), mkCandidate("b", null) };
+    const layout = MenuLayout.compute(&cands, 0, 80, 24, .{}, test_width_policy);
+    try std.testing.expect(layout.menu_rows >= 1);
 }
 
 test "renderer: writeBuffer no spans" {

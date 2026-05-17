@@ -40,6 +40,10 @@ pub const PastePolicy = enum {
     accept,
 };
 
+/// Re-export so users can refer to `zigline.CompletionMenuOptions`
+/// without reaching through `zigline.completion`.
+pub const CompletionMenuOptions = completion_mod.CompletionMenuOptions;
+
 /// Categorized diagnostic delivered to `Options.diagnostic_fn` when
 /// a hook fails or a hook returns invalid data. The library degrades
 /// gracefully — a failing highlighter just produces no spans, a
@@ -301,6 +305,37 @@ const YankLastArgState = struct {
 ///                      main buffer.
 ///   - non-empty      → render dim ghost text after the query.
 ///                      Enter accepts.
+/// Open completion menu state. While `Editor.menu_state != null`,
+/// key dispatch routes through `handleKeyMenu` (mirrors the
+/// transient-mode bypass), the renderer paints the menu below the
+/// prompt+buffer, and the buffer is mutated in-place to "preview"
+/// the currently-selected candidate. See SPEC.md §6.5 / §6.6.
+///
+/// Ownership: `candidates` and every `Candidate.insert` / `display`
+/// / `description` slice are allocator-owned (transferred from the
+/// `CompletionResult` that opened the menu). `pre_menu_buffer` is a
+/// `dupe()` of the buffer's bytes at open time and is restored on
+/// `Esc` / cancel. All allocations are freed in `closeMenu*`.
+const MenuState = struct {
+    /// Candidates, allocator-owned. Position-stable for the life of
+    /// the menu (no add/remove during navigation).
+    candidates: []completion_mod.Candidate,
+    /// Replacement range in the buffer at menu-open time. The
+    /// preview applies the selected candidate by reverting to
+    /// `pre_menu_buffer`, then replacing [start..end] with the
+    /// candidate's `insert` + (optional) `append`.
+    replacement_start: usize,
+    replacement_end: usize,
+    /// Index into `candidates` of the currently previewed selection.
+    selected_idx: usize = 0,
+    /// Snapshot of the main buffer at menu-open time. Restored byte-
+    /// for-byte on `Esc`. Used as the "old" side of the single
+    /// Replace undo step recorded on accept.
+    pre_menu_buffer: []u8,
+    /// Cursor byte offset at menu-open time. Restored on `Esc`.
+    pre_menu_cursor: usize,
+};
+
 const TransientState = struct {
     /// Cluster-aware UTF-8 buffer holding the user's search query.
     /// Reuses `Buffer` so cursor moves, multibyte handling, and
@@ -414,6 +449,12 @@ pub const Options = struct {
     /// returned `CustomActionResult`. Null disables; keymaps that
     /// never return a `.custom` action don't need to set this.
     custom_action: ?CustomActionHook = null,
+    /// Multi-candidate completion menu config. `null` disables the
+    /// menu (Tab on multi-candidate results falls back to the
+    /// single-line space-separated list — kept as a v0.x escape
+    /// hatch). See `completion.CompletionMenuOptions` for fields.
+    /// SPEC.md §6.5.
+    completion_menu: ?completion_mod.CompletionMenuOptions = .{},
 };
 
 /// The line editor.
@@ -496,6 +537,13 @@ pub const Editor = struct {
     /// on `transient.query` instead of the main buffer.
     transient: ?TransientState = null,
 
+    /// Live completion-menu state (multi-candidate Tab overlay).
+    /// `null` when no menu is open. While non-null, key dispatch
+    /// routes through `handleKeyMenu` and the renderer paints the
+    /// menu below the buffer. Mutually exclusive with `transient`
+    /// (opening either closes the other defensively).
+    menu_state: ?MenuState = null,
+
     pub fn init(allocator: Allocator, options: Options) !Editor {
         var editor: Editor = .{
             .allocator = allocator,
@@ -535,6 +583,7 @@ pub const Editor = struct {
         self.pending_keys.deinit(self.allocator);
         self.clearHintCache();
         self.exitTransientMode();
+        self.closeMenuFree();
     }
 
     /// Block until the user accepts, cancels, or sends EOF.
@@ -626,7 +675,13 @@ pub const Editor = struct {
                 },
                 .paste => |payload| {
                     if (try self.flushPendingSequence(prompt)) |result| return result;
-                    if (self.transient != null) {
+                    if (self.menu_state != null) {
+                        // Implicit accept-and-paste: the typed text
+                        // semantically continues editing past the
+                        // chosen completion.
+                        try self.acceptMenu();
+                        try self.handlePaste(payload);
+                    } else if (self.transient != null) {
                         try self.handleTransientPaste(payload);
                     } else {
                         try self.handlePaste(payload);
@@ -634,7 +689,12 @@ pub const Editor = struct {
                     try self.renderActive(prompt);
                 },
                 .key => |kev| {
-                    if (self.transient != null) {
+                    if (self.menu_state != null) {
+                        if (try self.handleKeyMenu(kev, prompt)) |result| {
+                            if (self.options.history) |h| h.resetCursor();
+                            return result;
+                        }
+                    } else if (self.transient != null) {
                         if (try self.handleKeyTransient(kev, prompt)) |result| {
                             if (self.options.history) |h| h.resetCursor();
                             return result;
@@ -816,11 +876,19 @@ pub const Editor = struct {
                 self.diag(.{ .kind = .highlight_hook_failed, .err = err });
             }
         }
-        const draw: ?renderer_mod.HintDraw = if (with_hint) self.computeHintDraw() else blk: {
+        // Menu and hint are mutually exclusive — when the menu is
+        // open, suppress hints so we don't paint ghost text inside
+        // the previewed selection.
+        const menu_draw: ?renderer_mod.MenuDraw = if (self.menu_state) |*m| .{
+            .candidates = m.candidates,
+            .selected_idx = m.selected_idx,
+            .options = self.options.completion_menu orelse completion_mod.CompletionMenuOptions{},
+        } else null;
+        const draw: ?renderer_mod.HintDraw = if (with_hint and menu_draw == null) self.computeHintDraw() else blk: {
             self.clearHintCache();
             break :blk null;
         };
-        try self.renderer.render(&self.terminal, prompt, &self.buffer, spans, draw);
+        try self.renderer.render(&self.terminal, prompt, &self.buffer, spans, draw, menu_draw);
     }
 
     /// Refresh the hint cache for the current buffer state and return
@@ -1046,6 +1114,7 @@ pub const Editor = struct {
             &t.query,
             &.{},
             hint_draw,
+            null, // menu and transient are mutually exclusive
         );
     }
 
@@ -1179,6 +1248,155 @@ pub const Editor = struct {
             // Tab, function keys, page up/down, insert, arrow_up/down,
             // unknown — no-op in transient mode.
             else => return null,
+        }
+    }
+
+    /// Whitelist key dispatcher for menu mode. Returns a
+    /// `ReadLineResult` only when a key escalates to line-cancel
+    /// (Ctrl-C). All other navigation / acceptance paths return
+    /// `null` and the read loop re-renders.
+    ///
+    /// Per SPEC.md §6.5 / §6.6: navigation keys move `selected_idx`
+    /// and re-preview; `Enter` accepts; `Esc` / `Ctrl-G` cancels;
+    /// `Ctrl-C` cancels the whole line WITHOUT committing the
+    /// preview; "any other key" implicitly accepts then reprocesses.
+    fn handleKeyMenu(
+        self: *Editor,
+        kev: input_mod.KeyEvent,
+        prompt: prompt_mod.Prompt,
+    ) !?ReadLineResult {
+        const menu = &self.menu_state.?;
+        const n = menu.candidates.len;
+
+        // Navigation primitives. Page size is recomputed at key
+        // time from the live terminal size so resize between key
+        // events doesn't desync the math.
+        const term_size = self.terminal.querySize();
+        const term_cols: usize = if (term_size.cols == 0) 80 else term_size.cols;
+        const term_rows: usize = if (term_size.rows == 0) 24 else term_size.rows;
+        const opts = self.options.completion_menu orelse completion_mod.CompletionMenuOptions{};
+        const layout = renderer_mod.MenuLayout.compute(
+            menu.candidates,
+            menu.selected_idx,
+            term_cols,
+            term_rows,
+            opts,
+            self.options.width_policy,
+        );
+        const page = if (layout.page_size == 0) 1 else layout.page_size;
+
+        switch (kev.code) {
+            .enter => {
+                try self.acceptMenu();
+                return null;
+            },
+            .escape => {
+                try self.cancelMenu();
+                return null;
+            },
+            .tab => {
+                const next = (menu.selected_idx + 1) % n;
+                try self.applyMenuPreview(next);
+                return null;
+            },
+            .arrow_down => {
+                const next = (menu.selected_idx + 1) % n;
+                try self.applyMenuPreview(next);
+                return null;
+            },
+            .arrow_up => {
+                const prev = if (menu.selected_idx == 0) n - 1 else menu.selected_idx - 1;
+                try self.applyMenuPreview(prev);
+                return null;
+            },
+            .arrow_left => {
+                // In grid mode, move one column left (one row in flat
+                // index terms). In descriptive mode the menu is a
+                // single column — treat as previous candidate.
+                const cols = if (layout.visible_cols == 0) 1 else layout.visible_cols;
+                if (layout.mode == .descriptive or cols <= 1) {
+                    const prev = if (menu.selected_idx == 0) n - 1 else menu.selected_idx - 1;
+                    try self.applyMenuPreview(prev);
+                } else {
+                    const next = if (menu.selected_idx == 0) n - 1 else menu.selected_idx - 1;
+                    try self.applyMenuPreview(next);
+                }
+                return null;
+            },
+            .arrow_right => {
+                const cols = if (layout.visible_cols == 0) 1 else layout.visible_cols;
+                if (layout.mode == .descriptive or cols <= 1) {
+                    const next = (menu.selected_idx + 1) % n;
+                    try self.applyMenuPreview(next);
+                } else {
+                    const next = (menu.selected_idx + 1) % n;
+                    try self.applyMenuPreview(next);
+                }
+                return null;
+            },
+            .page_down => {
+                const next = @min(menu.selected_idx + page, n - 1);
+                try self.applyMenuPreview(next);
+                return null;
+            },
+            .page_up => {
+                const prev = if (menu.selected_idx >= page) menu.selected_idx - page else 0;
+                try self.applyMenuPreview(prev);
+                return null;
+            },
+            .home => {
+                try self.applyMenuPreview(0);
+                return null;
+            },
+            .end => {
+                try self.applyMenuPreview(n - 1);
+                return null;
+            },
+            .char => |c| {
+                if (kev.mods.ctrl) {
+                    return switch (c) {
+                        // Ctrl-G: same as Esc.
+                        'g' => blk: {
+                            try self.cancelMenu();
+                            break :blk null;
+                        },
+                        // Ctrl-C: cancel the line WITHOUT committing
+                        // the previewed selection. The user
+                        // explicitly chose to abort the whole edit.
+                        'c' => blk: {
+                            try self.cancelMenu();
+                            break :blk try self.cancelCurrentLine(prompt);
+                        },
+                        // All other Ctrl- chords are "any other key":
+                        // accept the selection, then reprocess so the
+                        // chord can fire its normal binding.
+                        else => blk: {
+                            try self.acceptMenu();
+                            break :blk try self.handleKey(kev, prompt);
+                        },
+                    };
+                }
+                // Printable / Alt-modified: accept then reprocess.
+                try self.acceptMenu();
+                return try self.handleKey(kev, prompt);
+            },
+            .text => |bytes| {
+                _ = bytes;
+                // Treat synthesized text payloads as printable input
+                // — accept the selection, then reprocess.
+                try self.acceptMenu();
+                return try self.handleKey(kev, prompt);
+            },
+            // Unknown escape sequences: ignore. Auto-accepting on
+            // gibberish would be hostile.
+            .unknown => return null,
+            // Anything else (function keys with no menu binding,
+            // backspace/delete, etc.): accept and reprocess. The
+            // spec's "any other key dismisses + selects" rule.
+            else => {
+                try self.acceptMenu();
+                return try self.handleKey(kev, prompt);
+            },
         }
     }
 
@@ -1980,14 +2198,13 @@ pub const Editor = struct {
             self.diag(.{ .kind = .completion_hook_failed, .err = err });
             return;
         };
-        defer {
-            for (result.candidates) |c| {
-                self.allocator.free(c.insert);
-                if (c.display) |d| self.allocator.free(d);
-                if (c.description) |d| self.allocator.free(d);
-            }
-            self.allocator.free(result.candidates);
-        }
+        // Ownership: `result.candidates` (and each candidate's owned
+        // strings) is freed by `freeCompletionCandidates` in every
+        // path EXCEPT the one that opens the menu — `openMenu`
+        // transfers ownership into `MenuState`, and `closeMenuFree`
+        // frees later.
+        var freed = false;
+        defer if (!freed) freeCompletionCandidates(self.allocator, result.candidates);
 
         // Validate the replacement range against the live buffer.
         // A buggy hook returning out-of-range, inverted, or
@@ -2016,6 +2233,9 @@ pub const Editor = struct {
         }
 
         // Multiple matches: insert longest common prefix, then list.
+        // Classic shell behavior — first Tab extends to LCP, second
+        // Tab (or Tab when no LCP progress is possible) reveals the
+        // choices via the menu or single-line list.
         const lcp_full = longestCommonPrefix(result.candidates);
         const common = utf8TruncateToBoundary(lcp_full);
         const current = self.buffer.slice()[result.replacement_start..result.replacement_end];
@@ -2036,18 +2256,140 @@ pub const Editor = struct {
                 self.buffer.cursor_byte,
             );
             self.changeset.breakSequence();
+            return;
+        }
+
+        // Menu mode: open the columnar menu on the next render. This
+        // transfers ownership of `result.candidates` into MenuState;
+        // mark `freed` so the deferred free doesn't double-free.
+        // Disabled when `completion_menu == null` (the escape-hatch
+        // path falls through to the v0.1 single-line list below).
+        if (self.options.completion_menu != null) {
+            try self.openMenu(result.candidates, result.replacement_start, result.replacement_end);
+            freed = true;
+            return;
+        }
+
+        // Escape-hatch: single-line space-separated list (v0.1
+        // behavior). Move past the rendered block so the candidates
+        // don't print mid-prompt when the cursor is on a leading row.
+        try self.renderer.finalize(&self.terminal);
+        for (result.candidates, 0..) |c, i| {
+            const label = c.display orelse c.insert;
+            try self.writeCompletionLabel(label);
+            if (i + 1 < result.candidates.len) try self.terminal.writeAll("  ");
+        }
+        try self.terminal.writeAll("\r\n");
+        self.renderer.markFresh();
+    }
+
+    // =============================================================
+    // Completion menu lifecycle (SPEC.md §6.5 / §6.6)
+    // =============================================================
+
+    /// Open the completion menu, taking ownership of `candidates`.
+    /// Snapshots the buffer + cursor for preview/restore, applies
+    /// the first candidate's preview, and arms `menu_state`. The
+    /// next render will paint the menu below the buffer.
+    fn openMenu(
+        self: *Editor,
+        candidates: []completion_mod.Candidate,
+        replacement_start: usize,
+        replacement_end: usize,
+    ) !void {
+        // Defensive: never let two overlays coexist.
+        self.exitTransientMode();
+        // Clear any in-flight chord so a stale prefix doesn't
+        // re-resolve under menu dispatch.
+        self.pending_keys.clearRetainingCapacity();
+        self.clearHintCache();
+
+        // Snapshot pre-menu state. Errors must not leave a stale
+        // menu, so allocate before installing.
+        const pre_buf = try self.allocator.dupe(u8, self.buffer.slice());
+        errdefer self.allocator.free(pre_buf);
+
+        self.menu_state = .{
+            .candidates = candidates,
+            .replacement_start = replacement_start,
+            .replacement_end = replacement_end,
+            .selected_idx = 0,
+            .pre_menu_buffer = pre_buf,
+            .pre_menu_cursor = self.buffer.cursor_byte,
+        };
+
+        // Break the prior edit sequence so the eventual accept
+        // doesn't coalesce with typed characters before the menu.
+        self.changeset.breakSequence();
+
+        // Apply the initial preview (idx 0). On failure, tear the
+        // menu down before propagating so the editor doesn't end
+        // up in a half-armed state.
+        self.applyMenuPreview(0) catch |err| {
+            self.closeMenuFree();
+            return err;
+        };
+    }
+
+    /// Restore `pre_menu_buffer`, then re-apply the candidate at
+    /// `idx` in its place. Cursor lands at the end of the inserted
+    /// text plus the optional `append` byte (post-append, matching
+    /// the eventual accepted state). No undo step is recorded —
+    /// previews are transient.
+    fn applyMenuPreview(self: *Editor, idx: usize) !void {
+        var menu = &self.menu_state.?;
+        std.debug.assert(idx < menu.candidates.len);
+        menu.selected_idx = idx;
+
+        // Restore the pre-menu buffer first. `replaceAll` mutates
+        // without recording undo; that's the property we want.
+        try self.buffer.replaceAll(menu.pre_menu_buffer);
+        self.buffer.cursor_byte = menu.pre_menu_cursor;
+
+        const cand = menu.candidates[idx];
+        // Build the insertion bytes: `insert` + optional `append`.
+        if (cand.append) |a| {
+            var tmp = try self.allocator.alloc(u8, cand.insert.len + 1);
+            defer self.allocator.free(tmp);
+            @memcpy(tmp[0..cand.insert.len], cand.insert);
+            tmp[cand.insert.len] = a;
+            try self.replaceRangeAt(menu.replacement_start, menu.replacement_end, tmp);
         } else {
-            // Move past the rendered block so the candidate list
-            // doesn't print mid-prompt when the cursor is on a
-            // leading row of a multi-row buffer.
-            try self.renderer.finalize(&self.terminal);
-            for (result.candidates, 0..) |c, i| {
-                const label = c.display orelse c.insert;
-                try self.writeCompletionLabel(label);
-                if (i + 1 < result.candidates.len) try self.terminal.writeAll("  ");
-            }
-            try self.terminal.writeAll("\r\n");
-            self.renderer.markFresh();
+            try self.replaceRangeAt(menu.replacement_start, menu.replacement_end, cand.insert);
+        }
+    }
+
+    /// Accept the currently-previewed candidate. The buffer already
+    /// holds the previewed state (from `applyMenuPreview`); we just
+    /// record ONE whole-buffer Replace undo step (pre_menu_buffer →
+    /// final buffer) and tear down the menu.
+    fn acceptMenu(self: *Editor) !void {
+        const menu = &self.menu_state.?;
+        const old = menu.pre_menu_buffer;
+        const new = self.buffer.slice();
+        const cursor_before = menu.pre_menu_cursor;
+        const cursor_after = self.buffer.cursor_byte;
+        self.recordReplaceOrDiag(0, old, new, cursor_before, cursor_after);
+        self.changeset.breakSequence();
+        self.closeMenuFree();
+    }
+
+    /// Restore the pre-menu buffer state and tear down. No undo
+    /// step (the user never "did" anything observable).
+    fn cancelMenu(self: *Editor) !void {
+        const menu = &self.menu_state.?;
+        try self.buffer.replaceAll(menu.pre_menu_buffer);
+        self.buffer.cursor_byte = menu.pre_menu_cursor;
+        self.closeMenuFree();
+    }
+
+    /// Free all menu-owned allocations and clear `menu_state`. Safe
+    /// to call when no menu is open (idempotent no-op).
+    fn closeMenuFree(self: *Editor) void {
+        if (self.menu_state) |*menu| {
+            freeCompletionCandidates(self.allocator, menu.candidates);
+            self.allocator.free(menu.pre_menu_buffer);
+            self.menu_state = null;
         }
     }
 
@@ -2274,6 +2616,22 @@ fn mapPrintError(err: anyerror) PrintError {
         error.UnexpectedEof => PrintError.UnexpectedEof,
         else => PrintError.WriteFailed,
     };
+}
+
+/// Free a candidate slice plus every owned field on each candidate.
+/// Used both by the normal completion path and by the menu lifecycle
+/// (`closeMenuFree`) to keep one definition of "what does a candidate
+/// own" instead of duplicating the loop at every call site.
+fn freeCompletionCandidates(
+    allocator: Allocator,
+    candidates: []completion_mod.Candidate,
+) void {
+    for (candidates) |c| {
+        allocator.free(c.insert);
+        if (c.display) |d| allocator.free(d);
+        if (c.description) |d| allocator.free(d);
+    }
+    allocator.free(candidates);
 }
 
 fn longestCommonPrefix(cands: []completion_mod.Candidate) []const u8 {

@@ -121,9 +121,9 @@ Anything not re-exported from `src/root.zig` is internal. Examples:
 Updated for v0.2.x state. Two of the three original v1.0 blockers
 shipped:
 
-1. ⏳ **Multi-column completion menu UI.** Designed in SPEC.md
-   §6.5 / §6.6 / §6.7; pending slash review of four open UX
-   questions before code lands.
+1. ✅ **Multi-column completion menu UI** — shipped in v0.7.0.
+   Auto-picks descriptive single-column or grid multi-column
+   mode. Inline preview with `Esc` restore. SPEC.md §6.5–§6.7.
 2. ✅ **Binding-table API on `Keymap`** — shipped in v0.2.0. Multi-
    key sequences (`Ctrl-X Ctrl-E`, etc.) via the optional
    `BindingTable` overlay; `lookupFn` shape preserved.

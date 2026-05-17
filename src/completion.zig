@@ -71,6 +71,23 @@ pub const CandidateKind = enum {
     variable,
 };
 
+/// Configuration for the multi-candidate completion menu. See
+/// SPEC.md §6.5. Wired into the editor via
+/// `Options.completion_menu` (null disables the menu).
+pub const CompletionMenuOptions = struct {
+    /// Maximum candidate rows visible per page; the menu paginates
+    /// past this with `PageUp` / `PageDown` and renders an `(N/M)`
+    /// indicator. `null` = auto, `min(terminal_rows / 2, 10)`.
+    max_rows: ?usize = null,
+    /// When `true` and at least one candidate carries a non-null
+    /// `description`, the menu switches to single-column "descriptive"
+    /// mode (one candidate per row, description column to the right
+    /// in the dim style). When the description column would have
+    /// fewer than ~20 cells, the menu falls back to grid mode
+    /// regardless of this setting.
+    show_descriptions: bool = true,
+};
+
 test "completion: types compile" {
     const c = Candidate{ .insert = "ls" };
     _ = c;
