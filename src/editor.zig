@@ -126,7 +126,20 @@ pub const CustomActionContext = struct {
     pub fn pauseRawMode(self: CustomActionContext) !void {
         if (!self.editor.terminal.isInputTty()) return;
         if (!self.editor.owns_raw_mode) return;
-        try self.editor.renderer.finalize(&self.editor.terminal);
+        // Clear the rendered prompt+buffer in place (cursor lands
+        // at column 0 of the prompt's row, no trailing newline).
+        // The spawned process — vim's alt-screen, nano's full-tty
+        // takeover, /usr/bin/true's no-op — gets a clean canvas.
+        //
+        // Previously this used `finalize` which moves the cursor
+        // BELOW the rendered block without clearing. That worked
+        // visually for alt-screen editors but left a "ghost" of
+        // the old prompt + typed buffer visible above the
+        // post-spawn render — the user saw a duplicate prompt
+        // every time `edit-in-editor` fired. `clearRenderedBlock`
+        // is symmetric with `printAbove`'s prelude and gives the
+        // expected "modal swap" feel.
+        try self.editor.renderer.clearRenderedBlock(&self.editor.terminal);
         // `leaveRawMode` uninstalls the signal-guard and closes the
         // self-pipe. The reader holds the read-end of that pipe;
         // detach so polls don't fire on a closed fd. Re-attached in
