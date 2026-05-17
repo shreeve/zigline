@@ -92,6 +92,7 @@ pub const MAX_KEY_SEQUENCE = @import("keymap.zig").MAX_SEQUENCE;
 /// null for unbindable kinds (`text`, `unknown`). Exposed for apps
 /// that want to build their own indices keyed on KeyEvent.
 pub const encodeKeyEvent = @import("keymap.zig").encodeKeyEvent;
+pub const decodeKeyEvent = @import("keymap.zig").decodeKeyEvent;
 
 /// Multi-slot kill ring. Owned by `Editor`; size controlled via
 /// `Options.kill_ring_capacity`. Exposed for advanced use cases like

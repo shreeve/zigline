@@ -719,9 +719,20 @@ fn writeMenu(
             while (i < page_end) : (i += 1) {
                 const cand = menu.candidates[i];
                 const is_selected = i == menu.selected_idx;
-                if (is_selected) try w.writeAll("\x1b[7m");
+                if (is_selected) {
+                    // Reverse-video for selection; suppress any
+                    // per-candidate style (they composite badly
+                    // and the selection cue should be stable).
+                    try w.writeAll("\x1b[7m");
+                } else if (cand.style) |st| {
+                    try writeSgrOpen(w, st);
+                }
                 try writeSafeLabel(w, cand.display orelse cand.insert, layout.label_width, width_policy);
-                if (is_selected) try w.writeAll("\x1b[27m");
+                if (is_selected) {
+                    try w.writeAll("\x1b[27m");
+                } else if (cand.style != null) {
+                    try w.writeAll("\x1b[0m");
+                }
 
                 if (cand.description) |desc| {
                     if (desc.len > 0 and layout.desc_width > 0) {
@@ -749,9 +760,17 @@ fn writeMenu(
                     if (idx >= n or idx >= page_end) break;
                     const cand = menu.candidates[idx];
                     const is_selected = idx == menu.selected_idx;
-                    if (is_selected) try w.writeAll("\x1b[7m");
+                    if (is_selected) {
+                        try w.writeAll("\x1b[7m");
+                    } else if (cand.style) |st| {
+                        try writeSgrOpen(w, st);
+                    }
                     try writeSafeLabel(w, cand.display orelse cand.insert, layout.label_width, width_policy);
-                    if (is_selected) try w.writeAll("\x1b[27m");
+                    if (is_selected) {
+                        try w.writeAll("\x1b[27m");
+                    } else if (cand.style != null) {
+                        try w.writeAll("\x1b[0m");
+                    }
                     if (col + 1 < cols and (layout.page_offset + (col + 1) * visible_rows + row) < page_end) {
                         // Pad gap between columns.
                         var g: usize = 0;

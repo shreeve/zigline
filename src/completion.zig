@@ -61,6 +61,15 @@ pub const Candidate = struct {
     /// Character to append after insertion (e.g. '/' for directories,
     /// ' ' for completed commands).
     append: ?u8 = null,
+    /// Optional terminal style applied to this candidate's label
+    /// in the menu (bold/dim/italic/underline + optional fg/bg).
+    /// The menu renderer SUPPRESSES this style on the selected
+    /// row, where reverse-video already provides discrimination;
+    /// per-candidate styling over reverse-video is terminal-
+    /// dependent and often illegible. Hosts produce this from
+    /// upstream completion-source metadata (e.g. carapace's
+    /// `$style` field) — zigline just renders what it's handed.
+    style: ?@import("highlight.zig").Style = null,
 };
 
 pub const CandidateKind = enum {

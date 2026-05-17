@@ -269,6 +269,47 @@ pub fn encodeKeyEvent(kev: KeyEvent) ?u32 {
     return base;
 }
 
+/// Reverse of `encodeKeyEvent`. Returns null when the encoded value
+/// doesn't decode to a known event (corrupt input). Inverse-exact
+/// for every output `encodeKeyEvent` produces.
+pub fn decodeKeyEvent(encoded: u32) ?KeyEvent {
+    var mods: input.Modifiers = .{};
+    if ((encoded & MOD_CTRL) != 0) mods.ctrl = true;
+    if ((encoded & MOD_ALT) != 0) mods.alt = true;
+    if ((encoded & MOD_SHIFT) != 0) mods.shift = true;
+    const base = encoded & ~(MOD_CTRL | MOD_ALT | MOD_SHIFT);
+
+    if (base < FN_BASE) {
+        // Codepoint — `char` variant. Validate Unicode range.
+        if (base > 0x10FFFF) return null;
+        return .{ .code = .{ .char = @intCast(base) }, .mods = mods };
+    }
+    if (base < NAMED_BASE) {
+        const n = base - FN_BASE;
+        if (n == 0 or n > 12) return null;
+        return .{ .code = .{ .function = @intCast(n) }, .mods = mods };
+    }
+    const named = base - NAMED_BASE;
+    const code: input.KeyCode = switch (named) {
+        0 => .enter,
+        1 => .tab,
+        2 => .backspace,
+        3 => .delete,
+        4 => .escape,
+        5 => .home,
+        6 => .end,
+        7 => .page_up,
+        8 => .page_down,
+        9 => .arrow_up,
+        10 => .arrow_down,
+        11 => .arrow_left,
+        12 => .arrow_right,
+        13 => .insert,
+        else => return null,
+    };
+    return .{ .code = code, .mods = mods };
+}
+
 fn emacsLookup(key: KeyEvent) ?Action {
     // Named keys take priority.
     switch (key.code) {
